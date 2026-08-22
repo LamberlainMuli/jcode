@@ -48,6 +48,9 @@ pub struct AuthStatus {
     pub cursor: AuthState,
     /// Grok Build CLI is installed. Runtime auth is delegated to its cached login.
     pub grok_build: AuthState,
+    /// SuperGrok (`xai-oauth`) device-code session or `XAI_OAUTH_TOKEN`.
+    #[serde(default)]
+    pub xai_oauth: AuthState,
     /// Google/Gmail OAuth configured
     pub google: AuthState,
     /// Google Gmail has send capability (Full tier)

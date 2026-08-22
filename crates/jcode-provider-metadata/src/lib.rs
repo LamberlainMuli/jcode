@@ -35,6 +35,7 @@ pub enum LoginProviderTarget {
     OpenAiCompatible(OpenAiCompatibleProfile),
     Cursor,
     GrokBuild,
+    XaiOauth,
     Copilot,
     Gemini,
     Antigravity,
@@ -55,6 +56,7 @@ pub enum LoginProviderAuthStateKey {
     Antigravity,
     Cursor,
     GrokBuild,
+    XaiOauth,
     Google,
 }
 
@@ -702,6 +704,25 @@ mod tests {
         assert_eq!(
             resolve_login_selection("bedrock", &providers).map(|provider| provider.id),
             Some("bedrock")
+        );
+    }
+
+    #[test]
+    fn resolve_xai_oauth_and_supergrok_without_stealing_grok() {
+        let oauth = resolve_login_provider("xai-oauth").expect("xai-oauth");
+        assert_eq!(oauth.id, "xai-oauth");
+        assert_eq!(oauth.target, LoginProviderTarget::XaiOauth);
+        assert_eq!(
+            resolve_login_provider("supergrok").map(|provider| provider.id),
+            Some("xai-oauth")
+        );
+        assert_eq!(
+            resolve_login_provider("grok").map(|provider| provider.id),
+            Some("xai")
+        );
+        assert_eq!(
+            resolve_login_provider("xai").map(|provider| provider.id),
+            Some("xai")
         );
     }
 }

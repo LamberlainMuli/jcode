@@ -349,6 +349,34 @@ Cursor uses jcode's native HTTPS transport. Copilot uses GitHub device-flow auth
   - `JCODE_ANTIGRAVITY_PROMPT_FLAG` (default: `-p`)
   - `JCODE_ANTIGRAVITY_MODEL_FLAG` (default: `--model`)
 
+
+## xAI Grok OAuth (SuperGrok)
+
+SuperGrok is a third xAI product, separate from paid `xai` (`XAI_API_KEY`) and
+from `grok-build` (Jcode-managed Grok CLI ACP + `~/.grok/auth.json`).
+
+### Login
+- `jcode login --provider xai-oauth`
+- alias: `jcode login --provider supergrok`
+- TUI: `/login` and choose **xAI Grok OAuth (SuperGrok or X Premium+)**
+
+This is a native RFC 8628 device-code flow against `https://auth.x.ai`. Jcode
+prints the verification URL and user code, polls until you approve, and saves
+the tokens. It does **not** run `grok login` and never writes `~/.grok/auth.json`.
+
+### Store and env
+- Credentials: `~/.jcode/xai-oauth.json` (via `jcode_dir()`)
+- Env: `XAI_OAUTH_TOKEN` marks SuperGrok signed-in and is preferred over the
+  stored access token
+- `XAI_API_KEY` is **not** SuperGrok auth. It remains paid `xai` only. The
+  `grok` alias still resolves to paid `xai`.
+
+### Runtime notes
+- Default model hint: `grok-4.6`
+- Models are prefixed `xai-oauth:<model>` (same pattern as `grok-build:<model>`)
+- The Responses runtime factory is registered at process startup separately
+  from this identity/login path
+
 ## Google / Gmail OAuth
 
 ### Login steps

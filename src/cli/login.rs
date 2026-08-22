@@ -298,6 +298,9 @@ pub async fn run_login_provider(
             LoginProviderTarget::GrokBuild => login_grok_build_flow()
                 .await
                 .map(|_| LoginFlowOutcome::Completed),
+            LoginProviderTarget::XaiOauth => login_xai_oauth_flow(options.no_browser)
+                .await
+                .map(|_| LoginFlowOutcome::Completed),
             LoginProviderTarget::OpenRouter => {
                 login_openrouter_flow().map(|_| LoginFlowOutcome::Completed)
             }
@@ -428,6 +431,44 @@ async fn login_grok_build_flow() -> Result<()> {
     Ok(())
 }
 
+async fn login_xai_oauth_flow(no_browser: bool) -> Result<()> {
+    eprintln!("Starting xAI Grok OAuth (SuperGrok or X Premium+) login...");
+    let client = crate::provider::shared_http_client();
+    let authorization = crate::auth::xai_oauth::initiate_device_login(&client).await?;
+    let url = authorization
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&authorization.verification_uri);
+
+    eprintln!();
+    eprintln!("  Open this URL in your browser:");
+    eprintln!("    {url}");
+    eprintln!();
+    if let Some(qr) = crate::login_qr::indented_section(
+        url,
+        "  Or scan this QR on another device to open the verification page:",
+        "    ",
+    ) {
+        eprintln!("{qr}");
+        eprintln!();
+    }
+    eprintln!("  Enter code: {}", authorization.user_code);
+    eprintln!();
+    eprintln!("  Waiting for authorization...");
+
+    maybe_open_browser(url, no_browser);
+
+    let credentials =
+        crate::auth::xai_oauth::complete_device_login(&client, &authorization).await?;
+    if let Some(email) = credentials.email.as_deref() {
+        eprintln!("  Authenticated as {email} via SuperGrok");
+    } else {
+        eprintln!("  Authenticated via SuperGrok");
+    }
+    crate::telemetry::record_auth_success("xai-oauth", "oauth_device_code");
+    Ok(())
+}
+
 fn maybe_persist_default_provider_after_login(
     provider: LoginProviderDescriptor,
     options: &LoginOptions,
@@ -451,6 +492,7 @@ fn maybe_persist_default_provider_after_login(
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .or_else(|| resolve_openai_compatible_profile(profile).default_model),
+        LoginProviderTarget::XaiOauth => Some("grok-4.6".to_string()),
         _ => None,
     };
 

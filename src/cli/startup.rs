@@ -194,6 +194,10 @@ pub fn register_external_provider_runtimes() {
         },
     );
     crate::provider::external::register_external_provider(
+        crate::provider::external::XAI_OAUTH_RUNTIME,
+        || std::sync::Arc::new(jcode_provider_xai_oauth_runtime::XaiOauthProvider::new()),
+    );
+    crate::provider::external::register_external_provider(
         crate::provider::external::GEMINI_RUNTIME,
         || std::sync::Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new()),
     );

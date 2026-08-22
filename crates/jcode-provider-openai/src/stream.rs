@@ -236,6 +236,283 @@ pub struct StreamingToolCallState {
     arguments: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenAiResponseParseMode {
+    pub xai_oauth: bool,
+}
+
+#[derive(Debug, Default)]
+struct CompletionsToolCallState {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    started: bool,
+    ended: bool,
+    streamed_arg_len: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct XaiOauthParseState {
+    pub emitted_tool_call_ids: HashSet<String>,
+    completions_tool_calls: HashMap<usize, CompletionsToolCallState>,
+    pub saw_terminal: bool,
+}
+
+fn record_emitted_tool_call(extra: &mut XaiOauthParseState, id: &str) {
+    extra.emitted_tool_call_ids.insert(id.to_string());
+    let sanitized = sanitize_tool_id(id);
+    if sanitized != id {
+        extra.emitted_tool_call_ids.insert(sanitized);
+    }
+}
+
+fn note_parsed_event(
+    mode: OpenAiResponseParseMode,
+    extra: &mut XaiOauthParseState,
+    event: &StreamEvent,
+) {
+    if !mode.xai_oauth {
+        return;
+    }
+    match event {
+        StreamEvent::ToolUseStart { id, .. } => record_emitted_tool_call(extra, id),
+        StreamEvent::MessageEnd { .. } => extra.saw_terminal = true,
+        _ => {}
+    }
+}
+
+fn custom_tool_call_arguments(item: &Value) -> String {
+    if let Some(input) = item.get("input") {
+        if input.is_string() {
+            return serde_json::json!({ "input": input }).to_string();
+        }
+        if input.is_object() || input.is_array() {
+            return input.to_string();
+        }
+    }
+    item.get("arguments")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+fn harvest_completed_output_items(
+    response: &Value,
+    extra: &mut XaiOauthParseState,
+    pending: &mut VecDeque<StreamEvent>,
+) {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return;
+    };
+    for item in output {
+        let item_type = item.get("type").and_then(Value::as_str);
+        if !matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
+            continue;
+        }
+        let Some(call_id) = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if extra.emitted_tool_call_ids.contains(call_id)
+            || extra
+                .emitted_tool_call_ids
+                .contains(&sanitize_tool_id(call_id))
+        {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let arguments = if item_type == Some("custom_tool_call") {
+            custom_tool_call_arguments(item)
+        } else {
+            item.get("arguments")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "{}".to_string())
+        };
+        let arguments = normalize_openai_tool_arguments(arguments);
+        let id = sanitize_tool_id(call_id);
+        record_emitted_tool_call(extra, &id);
+        pending.push_back(StreamEvent::ToolUseStart { id, name });
+        pending.push_back(StreamEvent::ToolInputDelta(arguments));
+        pending.push_back(StreamEvent::ToolUseEnd);
+    }
+}
+
+fn is_completions_shaped_event(value: &Value) -> bool {
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("response."))
+    {
+        return false;
+    }
+    value.get("object").and_then(Value::as_str) == Some("chat.completion.chunk")
+        || value.get("choices").is_some_and(Value::is_array)
+}
+
+fn emit_completions_tool_start(
+    call: &mut CompletionsToolCallState,
+    extra: &mut XaiOauthParseState,
+    pending: &mut VecDeque<StreamEvent>,
+) -> Option<StreamEvent> {
+    if call.started {
+        return None;
+    }
+    let name = call.name.clone().filter(|value| !value.is_empty())?;
+    let raw_id = call
+        .call_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "fallback_text_call_{}",
+                FALLBACK_TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+    let id = sanitize_tool_id(&raw_id);
+    call.started = true;
+    record_emitted_tool_call(extra, &id);
+    if call.streamed_arg_len < call.arguments.len() {
+        let delta = call.arguments[call.streamed_arg_len..].to_string();
+        call.streamed_arg_len = call.arguments.len();
+        pending.push_back(StreamEvent::ToolInputDelta(delta));
+    }
+    Some(StreamEvent::ToolUseStart { id, name })
+}
+
+fn emit_completions_tool_end(
+    call: &mut CompletionsToolCallState,
+    extra: &mut XaiOauthParseState,
+    pending: &mut VecDeque<StreamEvent>,
+) -> Option<StreamEvent> {
+    if call.ended {
+        return None;
+    }
+    if !call.started {
+        if let Some(event) = emit_completions_tool_start(call, extra, pending) {
+            pending.push_front(event);
+        }
+    }
+    if !call.started {
+        return None;
+    }
+    if call.streamed_arg_len < call.arguments.len() {
+        let delta = call.arguments[call.streamed_arg_len..].to_string();
+        call.streamed_arg_len = call.arguments.len();
+        pending.push_back(StreamEvent::ToolInputDelta(delta));
+    }
+    call.ended = true;
+    pending.push_back(StreamEvent::ToolUseEnd);
+    pending.pop_front()
+}
+
+fn ingest_completions_shaped_chunk(
+    value: &Value,
+    extra: &mut XaiOauthParseState,
+    pending: &mut VecDeque<StreamEvent>,
+) -> Option<StreamEvent> {
+    let tool_calls = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("tool_calls"))
+        .and_then(Value::as_array);
+    if let Some(tool_calls) = tool_calls {
+        for tool_call in tool_calls {
+            let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut call = extra
+                .completions_tool_calls
+                .remove(&index)
+                .unwrap_or_default();
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                call.call_id = Some(id.to_string());
+            }
+            if let Some(function) = tool_call.get("function") {
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    call.name = Some(name.to_string());
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    call.arguments.push_str(arguments);
+                }
+            }
+            if let Some(event) = emit_completions_tool_start(&mut call, extra, pending) {
+                pending.push_front(event);
+            } else if call.started && call.streamed_arg_len < call.arguments.len() {
+                let delta = call.arguments[call.streamed_arg_len..].to_string();
+                call.streamed_arg_len = call.arguments.len();
+                pending.push_back(StreamEvent::ToolInputDelta(delta));
+            }
+            extra.completions_tool_calls.insert(index, call);
+        }
+    }
+    let finish_reason = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str);
+    if matches!(
+        finish_reason,
+        Some("tool_calls") | Some("stop") | Some("length") | Some("function_call")
+    ) {
+        let mut indexes: Vec<usize> = extra.completions_tool_calls.keys().copied().collect();
+        indexes.sort_unstable();
+        for index in indexes {
+            if let Some(mut call) = extra.completions_tool_calls.remove(&index)
+                && let Some(event) = emit_completions_tool_end(&mut call, extra, pending)
+            {
+                pending.push_front(event);
+            }
+        }
+    }
+    pending.pop_front()
+}
+
+pub fn finalize_xai_oauth_pending_tool_calls(
+    streaming_tool_calls: &mut HashMap<String, StreamingToolCallState>,
+    extra: &mut XaiOauthParseState,
+    pending: &mut VecDeque<StreamEvent>,
+) {
+    let mut indexes: Vec<usize> = extra.completions_tool_calls.keys().copied().collect();
+    indexes.sort_unstable();
+    for index in indexes {
+        if let Some(mut call) = extra.completions_tool_calls.remove(&index)
+            && let Some(event) = emit_completions_tool_end(&mut call, extra, pending)
+        {
+            pending.push_back(event);
+        }
+    }
+    let leftover: Vec<(String, StreamingToolCallState)> = streaming_tool_calls.drain().collect();
+    for (item_id, state) in leftover {
+        let call_id = state
+            .call_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(item_id.as_str());
+        if extra.emitted_tool_call_ids.contains(call_id)
+            || extra
+                .emitted_tool_call_ids
+                .contains(&sanitize_tool_id(call_id))
+        {
+            continue;
+        }
+        if let Some(event) = stream_tool_call_from_state(Some(item_id), state, pending) {
+            if let StreamEvent::ToolUseStart { id, .. } = &event {
+                record_emitted_tool_call(extra, id);
+            }
+            pending.push_back(event);
+        }
+    }
+}
+
 fn normalize_openai_tool_arguments(raw_arguments: String) -> String {
     let trimmed = raw_arguments.trim();
     if trimmed.is_empty() || trimmed == "null" {
@@ -298,7 +575,37 @@ pub fn parse_openai_response_event(
     completed_tool_items: &mut HashSet<String>,
     pending: &mut VecDeque<StreamEvent>,
 ) -> Option<StreamEvent> {
+    let mut extra = XaiOauthParseState::default();
+    parse_openai_response_event_with_mode(
+        data,
+        saw_text_delta,
+        saw_thinking_delta,
+        streaming_tool_calls,
+        completed_tool_items,
+        pending,
+        OpenAiResponseParseMode { xai_oauth: false },
+        &mut extra,
+    )
+}
+
+pub fn parse_openai_response_event_with_mode(
+    data: &str,
+    saw_text_delta: &mut bool,
+    saw_thinking_delta: &mut bool,
+    streaming_tool_calls: &mut HashMap<String, StreamingToolCallState>,
+    completed_tool_items: &mut HashSet<String>,
+    pending: &mut VecDeque<StreamEvent>,
+    mode: OpenAiResponseParseMode,
+    extra: &mut XaiOauthParseState,
+) -> Option<StreamEvent> {
     if data == "[DONE]" {
+        if mode.xai_oauth && !extra.saw_terminal {
+            finalize_xai_oauth_pending_tool_calls(streaming_tool_calls, extra, pending);
+            extra.saw_terminal = true;
+            pending.push_back(StreamEvent::MessageEnd { stop_reason: None });
+            return pending.pop_front();
+        }
+        extra.saw_terminal = true;
         return Some(StreamEvent::MessageEnd { stop_reason: None });
     }
 
@@ -316,6 +623,13 @@ pub fn parse_openai_response_event(
             message: data.to_string(),
             retry_after_secs: None,
         });
+    }
+
+    if mode.xai_oauth
+        && let Ok(value) = serde_json::from_str::<Value>(data)
+        && is_completions_shaped_event(&value)
+    {
+        return ingest_completions_shaped_chunk(&value, extra, pending);
     }
 
     let event: ResponseSseEvent = match serde_json::from_str(data) {
@@ -408,6 +722,7 @@ pub fn parse_openai_response_event(
                     stream_tool_call_from_state(Some(item_id.clone()), state.clone(), pending)
                 {
                     completed_tool_items.insert(item_id);
+                    note_parsed_event(mode, extra, &tool_event);
                     return Some(tool_event);
                 }
                 streaming_tool_calls.insert(item_id, state);
@@ -428,36 +743,34 @@ pub fn parse_openai_response_event(
                 if let Some(event) =
                     handle_openai_output_item(item, saw_text_delta, saw_thinking_delta, pending)
                 {
+                    note_parsed_event(mode, extra, &event);
                     return Some(event);
                 }
             }
         }
-        "response.incomplete" => {
-            let stop_reason = event
-                .response
-                .as_ref()
-                .and_then(extract_stop_reason_from_response)
-                .or_else(|| Some("incomplete".to_string()));
-            if let Some(response) = event.response
-                && let Some(usage_event) = extract_usage_from_response(&response)
-            {
-                pending.push_back(usage_event);
+        "response.incomplete" | "response.completed" | "response.done" => {
+            if event.kind == "response.done" && !mode.xai_oauth {
+                // OpenAI/Codex ignore response.done; SuperGrok harvests it.
+            } else {
+                let stop_reason = event
+                    .response
+                    .as_ref()
+                    .and_then(extract_stop_reason_from_response)
+                    .or_else(|| {
+                        (event.kind == "response.incomplete").then(|| "incomplete".to_string())
+                    });
+                if let Some(response) = event.response {
+                    if mode.xai_oauth {
+                        harvest_completed_output_items(&response, extra, pending);
+                    }
+                    if let Some(usage_event) = extract_usage_from_response(&response) {
+                        pending.push_back(usage_event);
+                    }
+                }
+                extra.saw_terminal = true;
+                pending.push_back(StreamEvent::MessageEnd { stop_reason });
+                return pending.pop_front();
             }
-            pending.push_back(StreamEvent::MessageEnd { stop_reason });
-            return pending.pop_front();
-        }
-        "response.completed" => {
-            let stop_reason = event
-                .response
-                .as_ref()
-                .and_then(extract_stop_reason_from_response);
-            if let Some(response) = event.response
-                && let Some(usage_event) = extract_usage_from_response(&response)
-            {
-                pending.push_back(usage_event);
-            }
-            pending.push_back(StreamEvent::MessageEnd { stop_reason });
-            return pending.pop_front();
         }
         "response.failed" | "response.error" | "error" => {
             jcode_logging::warn(&format!(
@@ -777,10 +1090,20 @@ pub struct OpenAIResponsesStream {
     saw_thinking_delta: bool,
     streaming_tool_calls: HashMap<String, StreamingToolCallState>,
     completed_tool_items: HashSet<String>,
+    mode: OpenAiResponseParseMode,
+    xai: XaiOauthParseState,
+    finalized_xai_oauth: bool,
 }
 
 impl OpenAIResponsesStream {
     pub fn new(stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static) -> Self {
+        Self::new_with_mode(stream, OpenAiResponseParseMode { xai_oauth: false })
+    }
+
+    pub fn new_with_mode(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        mode: OpenAiResponseParseMode,
+    ) -> Self {
         Self {
             inner: Box::pin(stream),
             buffer: String::new(),
@@ -790,6 +1113,9 @@ impl OpenAIResponsesStream {
             saw_thinking_delta: false,
             streaming_tool_calls: HashMap::new(),
             completed_tool_items: HashSet::new(),
+            mode,
+            xai: XaiOauthParseState::default(),
+            finalized_xai_oauth: false,
         }
     }
 
@@ -814,19 +1140,37 @@ impl OpenAIResponsesStream {
             }
 
             let data = data_lines.join("\n");
-            if let Some(event) = parse_openai_response_event(
+            if let Some(event) = parse_openai_response_event_with_mode(
                 &data,
                 &mut self.saw_text_delta,
                 &mut self.saw_thinking_delta,
                 &mut self.streaming_tool_calls,
                 &mut self.completed_tool_items,
                 &mut self.pending,
+                self.mode,
+                &mut self.xai,
             ) {
                 return Some(event);
             }
         }
 
         None
+    }
+
+    fn finalize_if_needed(&mut self) -> Option<StreamEvent> {
+        if !self.mode.xai_oauth || self.finalized_xai_oauth || self.xai.saw_terminal {
+            return None;
+        }
+        self.finalized_xai_oauth = true;
+        finalize_xai_oauth_pending_tool_calls(
+            &mut self.streaming_tool_calls,
+            &mut self.xai,
+            &mut self.pending,
+        );
+        self.xai.saw_terminal = true;
+        self.pending
+            .push_back(StreamEvent::MessageEnd { stop_reason: None });
+        self.pending.pop_front()
     }
 }
 
@@ -873,6 +1217,9 @@ impl Stream for OpenAIResponsesStream {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("Stream error: {}", e))));
                 }
                 Poll::Ready(None) => {
+                    if let Some(event) = self.finalize_if_needed() {
+                        return Poll::Ready(Some(Ok(event)));
+                    }
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
@@ -1028,5 +1375,176 @@ mod tests {
         );
 
         assert!(event.is_none());
+    }
+
+    fn drain_xai_oauth(data: &str, extra: &mut XaiOauthParseState) -> Vec<StreamEvent> {
+        let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
+        let mut streaming_tool_calls = HashMap::new();
+        let mut completed_tool_items = HashSet::new();
+        let mut pending = VecDeque::new();
+        let first = parse_openai_response_event_with_mode(
+            data,
+            &mut saw_text_delta,
+            &mut saw_thinking_delta,
+            &mut streaming_tool_calls,
+            &mut completed_tool_items,
+            &mut pending,
+            OpenAiResponseParseMode { xai_oauth: true },
+            extra,
+        );
+        let mut out = Vec::new();
+        if let Some(event) = first {
+            out.push(event);
+        }
+        out.extend(pending);
+        out
+    }
+
+    #[test]
+    fn xai_oauth_harvests_second_function_call_and_skips_already_streamed_id() {
+        let mut extra = XaiOauthParseState::default();
+        let streamed = drain_xai_oauth(
+            &serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{\"path\":\"a.rs\"}"
+            })
+            .to_string(),
+            &mut extra,
+        );
+        assert!(matches!(
+            streamed.first(),
+            Some(StreamEvent::ToolUseStart { id, name }) if id == "call_1" && name == "read"
+        ));
+
+        let harvested = drain_xai_oauth(
+            &serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "read",
+                            "arguments": "{\"path\":\"a.rs\"}"
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_2",
+                            "name": "bash",
+                            "arguments": "{\"command\":\"ls\"}"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+            &mut extra,
+        );
+
+        let starts: Vec<(&str, &str)> = harvested
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![("call_2", "bash")]);
+        assert!(
+            harvested
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+        );
+    }
+
+    #[test]
+    fn xai_oauth_ingests_completions_shaped_tool_calls() {
+        let mut extra = XaiOauthParseState::default();
+        let first = drain_xai_oauth(
+            &serde_json::json!({
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_x",
+                            "function": { "name": "read", "arguments": "{\"p" }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            &mut extra,
+        );
+        assert!(matches!(
+            first.first(),
+            Some(StreamEvent::ToolUseStart { id, name }) if id == "call_x" && name == "read"
+        ));
+        assert!(first.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolInputDelta(delta) if delta == "{\"p"
+        )));
+
+        let finished = drain_xai_oauth(
+            &serde_json::json!({
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": { "arguments": "ath\":\"a.rs\"}" }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+            .to_string(),
+            &mut extra,
+        );
+        assert!(finished.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolInputDelta(delta) if delta == "ath\":\"a.rs\"}"
+        )));
+        assert!(
+            finished
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolUseEnd))
+        );
+    }
+
+    #[test]
+    fn openai_mode_does_not_harvest_completed_output_function_calls() {
+        let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
+        let mut streaming_tool_calls = HashMap::new();
+        let mut completed_tool_items = HashSet::new();
+        let mut pending = VecDeque::new();
+        let event = parse_openai_response_event(
+            &serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call_hidden",
+                        "name": "read",
+                        "arguments": "{}"
+                    }]
+                }
+            })
+            .to_string(),
+            &mut saw_text_delta,
+            &mut saw_thinking_delta,
+            &mut streaming_tool_calls,
+            &mut completed_tool_items,
+            &mut pending,
+        );
+        assert!(matches!(event, Some(StreamEvent::MessageEnd { .. })));
+        assert!(pending.is_empty());
     }
 }

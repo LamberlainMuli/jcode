@@ -3411,6 +3411,7 @@ dependencies = [
  "jcode-provider-grok-build-runtime",
  "jcode-provider-openai-runtime",
  "jcode-provider-openrouter-runtime",
+ "jcode-provider-xai-oauth-runtime",
  "jcode-selfdev-types",
  "jcode-tui",
  "jcode-tui-session-picker",
@@ -4223,6 +4224,23 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+]
+
+[[package]]
+name = "jcode-provider-xai-oauth-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "jcode-base",
+ "jcode-message-types",
+ "jcode-provider-core",
+ "jcode-provider-openai",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

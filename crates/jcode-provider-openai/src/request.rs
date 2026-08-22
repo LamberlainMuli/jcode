@@ -3,6 +3,7 @@ use jcode_message_types::{
     sanitize_tool_id,
 };
 use jcode_provider_core::openai_schema::{
+    flatten_exclusive_required_root_union, leftover_xai_root_object_union,
     openai_compatible_schema, schema_supports_strict, strict_normalize_schema,
 };
 use serde_json::Value;
@@ -69,6 +70,68 @@ pub fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Build Responses tools for SuperGrok (`xai-oauth`) only.
+///
+/// OpenAI/Codex must keep using [`build_tools`], which retains exclusive-required
+/// root unions. This path flattens those unions, then quarantines leftover
+/// object-root unions so one MCP schema cannot 400 the whole turn.
+pub fn build_tools_for_xai_oauth(tools: &[ToolDefinition]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|t| {
+            let compatible_schema = openai_compatible_schema(&t.input_schema);
+            let flattened = flatten_exclusive_required_root_union(&compatible_schema);
+            let supports_strict = schema_supports_strict(&flattened);
+            let parameters = if supports_strict {
+                strict_normalize_schema(&flattened)
+            } else {
+                flattened
+            };
+            if leftover_xai_root_object_union(&parameters) {
+                jcode_logging::warn(&format!(
+                    "[xai-oauth] omitting tool '{}' because its leftover root union is invalid for xAI",
+                    t.name
+                ));
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "strict": supports_strict,
+                "parameters": parameters,
+            }))
+        })
+        .collect()
+}
+
+/// Drop a forced/required `tool_choice` that no longer matches surviving tools.
+pub fn reconcile_xai_oauth_tool_choice(tool_choice: &mut Value, tools: &[Value]) {
+    if tools.is_empty() {
+        *tool_choice = Value::Null;
+        return;
+    }
+    match tool_choice {
+        Value::String(choice) if choice == "required" || choice == "auto" || choice == "none" => {
+            if choice == "required" && tools.is_empty() {
+                *tool_choice = Value::Null;
+            }
+        }
+        Value::Object(map) => {
+            let forced_name = map.get("name").and_then(Value::as_str).map(str::to_string);
+            if let Some(name) = forced_name {
+                let survives = tools
+                    .iter()
+                    .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name.as_str()));
+                if !survives {
+                    *tool_choice = Value::Null;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn orphan_tool_output_to_user_message(item: &Value, missing_output: &str) -> Option<Value> {
@@ -707,5 +770,92 @@ mod tests {
                 .contains(&json!("ids")),
             "ids must stay required"
         );
+    }
+
+    fn coverage_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "mcp__codebase_memory_check_index_coverage".to_string(),
+            description: "coverage".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "scopes": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["project"],
+                "anyOf": [{ "required": ["paths"] }, { "required": ["scopes"] }]
+            }),
+        }
+    }
+
+    fn leftover_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "mcp__leftover_union".to_string(),
+            description: "union".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "kind": { "type": "string" } },
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "object", "properties": { "kind": { "type": "string" } } }
+                ]
+            }),
+        }
+    }
+
+    fn good_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "read a file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    #[test]
+    fn build_tools_keeps_exclusive_required_root_any_of() {
+        let api_tools = build_tools(&[coverage_tool()]);
+        assert!(
+            api_tools[0]["parameters"].get("anyOf").is_some(),
+            "OpenAI must still receive the exclusive-required root union"
+        );
+    }
+
+    #[test]
+    fn build_tools_for_xai_oauth_flattens_coverage_style_tool() {
+        let api_tools = build_tools_for_xai_oauth(&[coverage_tool()]);
+        assert_eq!(api_tools.len(), 1);
+        assert!(api_tools[0]["parameters"].get("anyOf").is_none());
+        assert_eq!(
+            api_tools[0]["name"],
+            json!("mcp__codebase_memory_check_index_coverage")
+        );
+    }
+
+    #[test]
+    fn build_tools_for_xai_oauth_quarantines_only_leftover_root_union() {
+        let api_tools = build_tools_for_xai_oauth(&[leftover_tool(), good_tool()]);
+        let names: Vec<&str> = api_tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn reconcile_xai_oauth_tool_choice_drops_forced_quarantined_tool() {
+        let tools = build_tools_for_xai_oauth(&[leftover_tool(), good_tool()]);
+        let mut choice = json!({ "type": "function", "name": "mcp__leftover_union" });
+        reconcile_xai_oauth_tool_choice(&mut choice, &tools);
+        assert!(choice.is_null());
+
+        let mut required = json!("required");
+        let empty: Vec<Value> = Vec::new();
+        reconcile_xai_oauth_tool_choice(&mut required, &empty);
+        assert!(required.is_null());
     }
 }

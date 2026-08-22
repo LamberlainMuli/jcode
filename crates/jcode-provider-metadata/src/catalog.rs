@@ -988,6 +988,22 @@ pub const XAI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor 
     order: LoginProviderSurfaceOrder::new(Some(33), Some(33), Some(33), Some(33), Some(33)),
 };
 
+/// SuperGrok / X Premium+ OAuth is a third xAI product: device-code against
+/// `auth.x.ai`, stored in `~/.jcode/xai-oauth.json`. It never consumes
+/// `XAI_API_KEY` and never writes `~/.grok/auth.json`.
+pub const XAI_OAUTH_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "xai-oauth",
+    display_name: "xAI Grok OAuth (SuperGrok or X Premium+)",
+    auth_kind: LoginProviderAuthKind::DeviceCode,
+    auth_state_key: LoginProviderAuthStateKey::XaiOauth,
+    auth_status_method: "SuperGrok device-code OAuth",
+    aliases: &["supergrok"],
+    menu_detail: "SuperGrok or X Premium+ subscription via device code",
+    recommended: false,
+    target: LoginProviderTarget::XaiOauth,
+    order: LoginProviderSurfaceOrder::new(Some(34), Some(34), Some(34), Some(34), Some(34)),
+};
+
 /// Grok Build is intentionally a separate identity from `xai`: Jcode manages
 /// its subscription backend and never consumes `XAI_API_KEY`.
 pub const GROK_BUILD_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
@@ -1177,7 +1193,7 @@ pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), None, None, None, None),
 };
 
-pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 51] = [
+pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 52] = [
     AUTO_IMPORT_LOGIN_PROVIDER,
     CLAUDE_LOGIN_PROVIDER,
     ANTHROPIC_API_LOGIN_PROVIDER,
@@ -1215,6 +1231,7 @@ pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 51] = [
     FIREWORKS_LOGIN_PROVIDER,
     MINIMAX_LOGIN_PROVIDER,
     XAI_LOGIN_PROVIDER,
+    XAI_OAUTH_LOGIN_PROVIDER,
     GROK_BUILD_LOGIN_PROVIDER,
     NVIDIA_NIM_LOGIN_PROVIDER,
     XIAOMI_MIMO_LOGIN_PROVIDER,

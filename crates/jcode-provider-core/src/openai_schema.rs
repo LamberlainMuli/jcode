@@ -16,6 +16,89 @@ pub fn openai_compatible_schema(schema: &Value) -> Value {
     jcode_schema_dialect::normalize(schema, &jcode_schema_dialect::registry::OPENAI)
 }
 
+/// Flatten an object-root exclusive-required `anyOf`/`oneOf` for xAI.
+///
+/// Copy, do not recurse. Other providers must keep the union because it is a
+/// real model-facing constraint.
+pub fn flatten_exclusive_required_root_union(schema: &Value) -> Value {
+    let Some(map) = schema.as_object() else {
+        return schema.clone();
+    };
+    let union_key = if map.get("anyOf").and_then(Value::as_array).is_some() {
+        "anyOf"
+    } else if map.get("oneOf").and_then(Value::as_array).is_some() {
+        "oneOf"
+    } else {
+        return schema.clone();
+    };
+    let Some(union) = map.get(union_key).and_then(Value::as_array) else {
+        return schema.clone();
+    };
+    if union.is_empty() {
+        return schema.clone();
+    }
+    let typed_object = schema_is_object_typed(map);
+    if !typed_object && !map.get("properties").is_some_and(Value::is_object) {
+        return schema.clone();
+    }
+    if !union.iter().all(is_exclusive_required_branch) {
+        return schema.clone();
+    }
+    let mut flattened = map.clone();
+    flattened.remove(union_key);
+    Value::Object(flattened)
+}
+
+fn is_exclusive_required_branch(branch: &Value) -> bool {
+    let Some(map) = branch.as_object() else {
+        return false;
+    };
+    if map.contains_key("type") {
+        return false;
+    }
+    let Some(required) = map.get("required").and_then(Value::as_array) else {
+        return false;
+    };
+    if required.is_empty()
+        || !required
+            .iter()
+            .all(|name| name.as_str().is_some_and(|value| !value.is_empty()))
+    {
+        return false;
+    }
+    map.keys()
+        .all(|key| matches!(key.as_str(), "required" | "description" | "title"))
+}
+
+/// True when an object-root schema still has a leftover anyOf/oneOf whose
+/// branches are typeless or non-object. xAI 400s the whole turn on that shape.
+pub fn leftover_xai_root_object_union(schema: &Value) -> bool {
+    let Some(map) = schema.as_object() else {
+        return false;
+    };
+    if !schema_is_object_typed(map) && !map.get("properties").is_some_and(Value::is_object) {
+        return false;
+    }
+    for key in ["anyOf", "oneOf"] {
+        let Some(branches) = map.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        if branches.is_empty() {
+            continue;
+        }
+        let has_non_object_branch = branches.iter().any(|branch| {
+            let Some(branch_map) = branch.as_object() else {
+                return true;
+            };
+            !schema_is_object_typed(branch_map)
+        });
+        if has_non_object_branch {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a schema declares enough type information for OpenAI strict mode.
 /// An "empty" schema like `{"description": "..."}` accepts any instance in JSON
 /// Schema, but OpenAI's strict subset requires a concrete type keyword.
@@ -351,10 +434,11 @@ pub fn strict_normalize_schema(schema: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
+        flatten_exclusive_required_root_union, leftover_xai_root_object_union,
         make_schema_nullable, openai_compatible_schema, schema_supports_strict,
         strict_normalize_schema,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn strict_normalize_schema_marks_optional_properties_nullable_and_required() {
@@ -750,5 +834,77 @@ mod tests {
             schema_supports_strict(&openai_compatible_schema(&schema)),
             "a well-formed schema must keep strict mode"
         );
+    }
+
+    fn coverage_style_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project": { "type": "string" },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "scopes": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["project"],
+            "anyOf": [{ "required": ["paths"] }, { "required": ["scopes"] }]
+        })
+    }
+
+    #[test]
+    fn flatten_removes_exclusive_required_root_any_of() {
+        let flattened = flatten_exclusive_required_root_union(&coverage_style_schema());
+        assert!(flattened.get("anyOf").is_none());
+        assert_eq!(flattened["type"], json!("object"));
+        assert_eq!(flattened["required"], json!(["project"]));
+        assert!(flattened["properties"].get("paths").is_some());
+        assert!(!leftover_xai_root_object_union(&flattened));
+    }
+
+    #[test]
+    fn flatten_keeps_nested_any_of() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "integer" }
+                    ]
+                }
+            }
+        });
+        let flattened = flatten_exclusive_required_root_union(&schema);
+        assert_eq!(
+            flattened["properties"]["filter"]["anyOf"],
+            json!([{ "type": "string" }, { "type": "integer" }])
+        );
+    }
+
+    #[test]
+    fn flatten_keeps_typed_object_root_any_of() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "kind": { "type": "string" } },
+            "anyOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "string" } } }
+            ]
+        });
+        let flattened = flatten_exclusive_required_root_union(&schema);
+        assert!(flattened.get("anyOf").is_some());
+        assert!(!leftover_xai_root_object_union(&flattened));
+    }
+
+    #[test]
+    fn leftover_detects_typeless_or_non_object_root_union() {
+        let leftover = json!({
+            "type": "object",
+            "properties": { "kind": { "type": "string" } },
+            "anyOf": [
+                { "required": ["kind"], "minProperties": 1 },
+                { "required": ["kind"], "minProperties": 2 }
+            ]
+        });
+        assert!(leftover_xai_root_object_union(&leftover));
+        assert_eq!(flatten_exclusive_required_root_union(&leftover), leftover);
     }
 }

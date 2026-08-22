@@ -104,6 +104,7 @@ impl MultiProvider {
             | LoginProviderTarget::Azure
             | LoginProviderTarget::GrokBuild
             | LoginProviderTarget::Google => None,
+            LoginProviderTarget::XaiOauth => Some("xai-oauth"),
         }
     }
 

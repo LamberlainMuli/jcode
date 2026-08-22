@@ -1,0 +1,29 @@
+[package]
+name = "jcode-provider-xai-oauth-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "SuperGrok xAI OAuth Responses runtime for jcode, kept downstream of jcode-base so provider edits do not rebuild the app spine"
+
+[lib]
+name = "jcode_provider_xai_oauth_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+# default-features = false: the top-level binary decides heavy optional base
+# features (embeddings/bedrock). Runtime crates must not re-enable them via
+# feature unification.
+jcode-base = { path = "../jcode-base", default-features = false }
+jcode-message-types = { path = "../jcode-message-types" }
+jcode-provider-core = { path = "../jcode-provider-core" }
+jcode-provider-openai = { path = "../jcode-provider-openai" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls", "rustls-tls-native-roots"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio-stream = "0.1"
+
+[dev-dependencies]
+jcode-base = { path = "../jcode-base", default-features = false, features = ["test-support"] }
+tokio = { version = "1", features = ["macros", "rt"] }

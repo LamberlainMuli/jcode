@@ -326,6 +326,7 @@ use self::state::ProviderState;
 pub use self::state::{ProviderModelSelectionSource, ProviderRuntimeState, ProviderStateEvent};
 
 pub(crate) const GROK_BUILD_PROFILE_ID: &str = "grok-build";
+pub(crate) const XAI_OAUTH_PROFILE_ID: &str = "xai-oauth";
 
 /// MultiProvider wraps multiple providers and allows seamless model switching
 pub struct MultiProvider {
@@ -1521,6 +1522,14 @@ impl MultiProvider {
             crate::logging::info("Hot-initialized Grok Build provider after login");
             registry.install_compatible_profile(GROK_BUILD_PROFILE_ID, grok);
         }
+        if crate::auth::xai_oauth::has_cached_login()
+            && registry.compatible_profile(XAI_OAUTH_PROFILE_ID).is_none()
+            && let Some(xai_oauth) =
+                external::instantiate_expected_external_provider(external::XAI_OAUTH_RUNTIME)
+        {
+            crate::logging::info("Hot-initialized SuperGrok provider after login");
+            registry.install_compatible_profile(XAI_OAUTH_PROFILE_ID, xai_oauth);
+        }
 
         if let Some(anthropic) = self.anthropic_provider() {
             self.spawn_post_auth_model_refresh(anthropic, "Anthropic");
@@ -1549,6 +1558,12 @@ impl MultiProvider {
         if let Some(grok) = ProviderRegistry::new(self).compatible_profile(GROK_BUILD_PROFILE_ID) {
             self.spawn_post_auth_model_refresh(grok, "Grok Build");
         }
+        if let Some(xai_oauth) =
+            ProviderRegistry::new(self).compatible_profile(XAI_OAUTH_PROFILE_ID)
+        {
+            self.spawn_post_auth_model_refresh(xai_oauth, "xAI Grok OAuth");
+        }
+
         crate::logging::auth_event("auth_changed_completed", "multi-provider", &[]);
     }
 
@@ -1994,6 +2009,25 @@ impl Provider for MultiProvider {
             provider.set_model(target_model)?;
             registry.install_compatible_profile(GROK_BUILD_PROFILE_ID, provider);
             registry.set_active_compatible_profile(GROK_BUILD_PROFILE_ID);
+            self.set_active_provider(ActiveProvider::OpenRouter);
+            return Ok(());
+        }
+
+        if let Some(target_model) = requested_model.strip_prefix("xai-oauth:") {
+            let target_model = target_model.trim();
+            if target_model.is_empty() {
+                anyhow::bail!("xAI Grok OAuth model cannot be empty");
+            }
+            let registry = ProviderRegistry::new(self);
+            let provider = registry
+                .compatible_profile(XAI_OAUTH_PROFILE_ID)
+                .or_else(|| {
+                    external::instantiate_expected_external_provider(external::XAI_OAUTH_RUNTIME)
+                })
+                .ok_or_else(|| anyhow!("xAI Grok OAuth is not authenticated"))?;
+            provider.set_model(target_model)?;
+            registry.install_compatible_profile(XAI_OAUTH_PROFILE_ID, provider);
+            registry.set_active_compatible_profile(XAI_OAUTH_PROFILE_ID);
             self.set_active_provider(ActiveProvider::OpenRouter);
             return Ok(());
         }
