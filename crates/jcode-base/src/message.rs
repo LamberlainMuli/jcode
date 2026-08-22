@@ -47,6 +47,44 @@ fn compile_static_regexes(patterns: &[&str]) -> Vec<Regex> {
         .collect()
 }
 
+/// Well-known credential variable names seeded into the per-run redaction
+/// set. Each name must appear exactly once; duplicates are dead weight and
+/// omissions silently weaken redaction coverage.
+const REDACTED_KEY_NAMES: &[&str] = &[
+    "OPENROUTER_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENCODE_GO_API_KEY",
+    "ZHIPU_API_KEY",
+    "ZAI_API_KEY",
+    "302AI_API_KEY",
+    "BASETEN_API_KEY",
+    "CORTECS_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "FIRMWARE_API_KEY",
+    "HF_TOKEN",
+    "MOONSHOT_API_KEY",
+    "NEBIUS_API_KEY",
+    "SCALEWAY_API_KEY",
+    "STACKIT_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "TOGETHER_API_KEY",
+    "DEEPINFRA_API_KEY",
+    "XAI_API_KEY",
+    "XAI_OAUTH_TOKEN",
+    "LMSTUDIO_API_KEY",
+    "OLLAMA_API_KEY",
+    "CHUTES_API_KEY",
+    "CEREBRAS_API_KEY",
+    "OPENAI_COMPAT_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "CURSOR_API_KEY",
+    "GITHUB_TOKEN",
+];
+
 /// Redact likely secrets from persisted tool output.
 ///
 /// This is a best-effort safeguard for local session history files. It targets
@@ -141,44 +179,10 @@ pub fn redact_secrets(text: &str) -> String {
     });
 
     let mut redacted = text.to_string();
-    let mut redacted_keys: HashSet<String> = [
-        "OPENROUTER_API_KEY",
-        "OPENCODE_API_KEY",
-        "OPENCODE_GO_API_KEY",
-        "ZHIPU_API_KEY",
-        "ZAI_API_KEY",
-        "302AI_API_KEY",
-        "BASETEN_API_KEY",
-        "CORTECS_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "FIRMWARE_API_KEY",
-        "HF_TOKEN",
-        "MOONSHOT_API_KEY",
-        "NEBIUS_API_KEY",
-        "SCALEWAY_API_KEY",
-        "STACKIT_API_KEY",
-        "GROQ_API_KEY",
-        "MISTRAL_API_KEY",
-        "PERPLEXITY_API_KEY",
-        "XAI_API_KEY",
-        "XAI_OAUTH_TOKEN",
-        "LMSTUDIO_API_KEY",
-        "DEEPINFRA_API_KEY",
-        "XAI_API_KEY",
-        "LMSTUDIO_API_KEY",
-        "OLLAMA_API_KEY",
-        "CHUTES_API_KEY",
-        "CEREBRAS_API_KEY",
-        "OPENAI_COMPAT_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "AZURE_OPENAI_API_KEY",
-        "CURSOR_API_KEY",
-        "GITHUB_TOKEN",
-    ]
-    .iter()
-    .map(|k| (*k).to_string())
-    .collect();
+    let mut redacted_keys: HashSet<String> = REDACTED_KEY_NAMES
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
 
     for re in direct_patterns {
         redacted = re.replace_all(&redacted, "[REDACTED_SECRET]").into_owned();

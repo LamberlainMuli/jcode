@@ -48,6 +48,26 @@ fn auth_state_default_is_not_configured() {
 }
 
 #[test]
+fn has_any_available_counts_cursor_and_xai_oauth() {
+    let mut status = AuthStatus::default();
+    assert!(!status.has_any_available());
+
+    status.cursor = AuthState::Available;
+    assert!(
+        status.has_any_available(),
+        "cursor-only auth must report any_available"
+    );
+
+    let mut both = AuthStatus::default();
+    both.cursor = AuthState::Available;
+    both.xai_oauth = AuthState::Available;
+    assert!(both.has_any_available());
+
+    let mut xai_only = AuthStatus::default();
+    xai_only.xai_oauth = AuthState::Available;
+    assert!(xai_only.has_any_available());
+}
+
 fn auth_status_default_all_not_configured() {
     let status = AuthStatus::default();
     assert_eq!(status.anthropic.state, AuthState::NotConfigured);

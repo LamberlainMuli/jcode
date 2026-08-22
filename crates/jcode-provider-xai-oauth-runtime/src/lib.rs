@@ -29,7 +29,6 @@ const SEED_MODELS: &[&str] = &[
     "grok-4.5",
     "grok-4.20-0309-reasoning",
     "grok-code-fast-1",
-    "grok-build",
 ];
 const INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -80,7 +79,7 @@ impl XaiOauthProvider {
         self
     }
 
-    fn resolve_access_token(&self) -> Result<String> {
+    async fn ensure_access_token(&self) -> Result<String> {
         if let Some(token) = self
             .token
             .as_deref()
@@ -97,8 +96,13 @@ impl XaiOauthProvider {
                 return Ok(trimmed.to_string());
             }
         }
-        jcode_base::auth::xai_oauth::access_token()
+        jcode_base::auth::xai_oauth::ensure_access_token(&self.client)
+            .await
             .context("xai-oauth token missing: set XAI_OAUTH_TOKEN or complete SuperGrok login")
+    }
+
+    fn refreshable_file_token(&self) -> bool {
+        self.token.is_none() && jcode_base::auth::xai_oauth::can_refresh_stored_credentials()
     }
 
     fn user_agent() -> String {
@@ -211,31 +215,65 @@ fn parse_models_payload(value: &Value) -> Vec<String> {
         .collect()
 }
 
+fn responses_url() -> String {
+    let base = std::env::var("JCODE_XAI_OAUTH_API_BASE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| API_BASE.to_string());
+    format!("{}/responses", base.trim_end_matches('/'))
+}
+
 async fn stream_xai_oauth_response(
     client: Client,
-    token: String,
+    mut token: String,
     request: Value,
     prompt_cache_key: Option<String>,
     tx: mpsc::Sender<Result<StreamEvent>>,
+    refreshable: bool,
 ) -> Result<()> {
-    let url = format!("{API_BASE}/responses");
-    let user_agent = XaiOauthProvider::user_agent();
-    let mut builder = client
-        .post(url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", user_agent)
-        .header("Accept", "text/event-stream");
-    if let Some(key) = prompt_cache_key.as_deref() {
-        builder = builder.header("x-grok-conv-id", key);
-    }
+    let url = responses_url();
+    let mut retried_unauthorized = false;
+    let response = loop {
+        let user_agent = XaiOauthProvider::user_agent();
+        let mut builder = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", user_agent)
+            .header("Accept", "text/event-stream");
+        if let Some(key) = prompt_cache_key.as_deref() {
+            builder = builder.header("x-grok-conv-id", key);
+        }
 
-    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
-        builder.json(&request),
-        INITIAL_RESPONSE_TIMEOUT,
-    )
-    .await
-    .context("Failed to send xai-oauth Responses request")?;
+        let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+            builder.json(&request),
+            INITIAL_RESPONSE_TIMEOUT,
+        )
+        .await
+        .context("Failed to send xai-oauth Responses request")?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && refreshable
+            && !retried_unauthorized
+        {
+            retried_unauthorized = true;
+            match jcode_base::auth::xai_oauth::refresh_access_token(&client).await {
+                Ok(credentials) => {
+                    token = credentials.access_token;
+                    continue;
+                }
+                Err(error) => {
+                    let status = response.status();
+                    let body = jcode_provider_core::http_error_body(response, "xai-oauth").await;
+                    anyhow::bail!(
+                        "xai-oauth API error {status}: {body} (refresh failed: {error})"
+                    );
+                }
+            }
+        }
+        break response;
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -288,7 +326,8 @@ impl Provider for XaiOauthProvider {
         system: &str,
         resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
-        let token = self.resolve_access_token()?;
+        let token = self.ensure_access_token().await?;
+        let refreshable = self.refreshable_file_token();
         let model = self.current_model();
         let input = build_responses_input(messages);
         let api_tools = build_tools_for_xai_oauth(tools);
@@ -304,9 +343,15 @@ impl Provider for XaiOauthProvider {
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
         let client = self.client.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                stream_xai_oauth_response(client, token, request, prompt_cache_key, tx.clone())
-                    .await
+            if let Err(error) = stream_xai_oauth_response(
+                client,
+                token,
+                request,
+                prompt_cache_key,
+                tx.clone(),
+                refreshable,
+            )
+            .await
             {
                 let _ = tx.send(Err(error)).await;
             }
@@ -366,7 +411,7 @@ impl Provider for XaiOauthProvider {
     }
 
     async fn prefetch_models(&self) -> Result<()> {
-        let Ok(token) = self.resolve_access_token() else {
+        let Ok(token) = self.ensure_access_token().await else {
             return Ok(());
         };
         let url = format!("{API_BASE}/models");
@@ -415,8 +460,12 @@ impl Provider for XaiOauthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jcode_base::auth::xai_oauth::{
+        ENV_TOKEN, XaiOauthCredentials, load_credentials, save_credentials,
+    };
     use jcode_message_types::ToolDefinition;
-
+    use std::ffi::{OsStr, OsString};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     #[test]
     fn parallel_tool_calls_true_iff_tools_non_empty() {
         let with_tools = build_xai_oauth_response_request(
@@ -429,6 +478,7 @@ mod tests {
         assert_eq!(with_tools["parallel_tool_calls"], json!(true));
         assert_eq!(with_tools["tool_choice"], json!("auto"));
         assert_eq!(with_tools["stream"], json!(true));
+
         assert_eq!(with_tools["store"], json!(false));
         assert!(with_tools.get("reasoning").is_none());
         assert!(with_tools.get("presence_penalty").is_none());
@@ -439,6 +489,14 @@ mod tests {
         assert!(empty.get("tool_choice").is_none());
         assert_eq!(empty["prompt_cache_key"], json!("sess"));
     }
+    #[test]
+    fn seed_models_exclude_grok_build() {
+        assert!(
+            !SEED_MODELS.contains(&"grok-build"),
+            "grok-build is a separate product and must not be offered via xai-oauth"
+        );
+    }
+
 
     #[test]
     fn identity_defaults() {
@@ -474,5 +532,123 @@ mod tests {
         assert!(tools[0]["parameters"].get("anyOf").is_none());
         let request = build_xai_oauth_response_request("grok-4.6", "", &[], &tools, None);
         assert_eq!(request["parallel_tool_calls"], json!(true));
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            jcode_base::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            jcode_base::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => jcode_base::env::set_var(self.key, value),
+                None => jcode_base::env::remove_var(self.key),
+            }
+        }
+    }
+
+    async fn serve_http_sequence(replies: Vec<(u16, &'static str, &'static str)>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for (status, content_type, body) in replies {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).await.unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("content-length:")
+                        && let Some((_, value)) = line.split_once(':')
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut buf = vec![0u8; content_length];
+                    reader.read_exact(&mut buf).await.unwrap();
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                writer.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn retries_responses_once_after_401_refresh() {
+        let _lock = jcode_base::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        let _oauth = EnvVarGuard::unset(ENV_TOKEN);
+        save_credentials(&XaiOauthCredentials {
+            access_token: "stale-access".to_string(),
+            refresh_token: Some("stored-refresh".to_string()),
+            expires_at: Some(1_800_000_000_000),
+            account: None,
+            email: None,
+        })
+        .unwrap();
+
+        let token_body = r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
+        let sse_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[]}}\n\n";
+        let port = serve_http_sequence(vec![
+            (401, "application/json", r#"{"error":"invalid_token"}"#),
+            (200, "application/json", token_body),
+            (200, "text/event-stream", sse_body),
+        ])
+        .await;
+        let origin = format!("http://127.0.0.1:{port}");
+        let _api = EnvVarGuard::set("JCODE_XAI_OAUTH_API_BASE", &origin);
+        let _token_url = EnvVarGuard::set(
+            "JCODE_XAI_OAUTH_TOKEN_URL",
+            format!("{origin}/oauth2/token"),
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        stream_xai_oauth_response(
+            reqwest::Client::new(),
+            "stale-access".to_string(),
+            json!({"model": "grok-4.6", "input": [], "stream": true}),
+            None,
+            tx,
+            true,
+        )
+        .await
+        .expect("401 should refresh and retry");
+
+        let first = rx.recv().await.expect("connection event");
+        assert!(matches!(
+            first,
+            Ok(StreamEvent::ConnectionType { .. })
+        ));
+        assert_eq!(
+            load_credentials().unwrap().access_token,
+            "new-access"
+        );
     }
 }

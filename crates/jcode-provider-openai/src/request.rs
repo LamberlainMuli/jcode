@@ -114,11 +114,6 @@ pub fn reconcile_xai_oauth_tool_choice(tool_choice: &mut Value, tools: &[Value])
         return;
     }
     match tool_choice {
-        Value::String(choice) if choice == "required" || choice == "auto" || choice == "none" => {
-            if choice == "required" && tools.is_empty() {
-                *tool_choice = Value::Null;
-            }
-        }
         Value::Object(map) => {
             let forced_name = map.get("name").and_then(Value::as_str).map(str::to_string);
             if let Some(name) = forced_name {

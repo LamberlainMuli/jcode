@@ -287,6 +287,32 @@ fn redact_secrets_redacts_env_style_assignments() {
 }
 
 #[test]
+fn redacted_key_names_contain_together_exactly_once() {
+    for name in ["TOGETHER_API_KEY", "XAI_API_KEY", "LMSTUDIO_API_KEY"] {
+        let count = REDACTED_KEY_NAMES
+            .iter()
+            .filter(|candidate| **candidate == name)
+            .count();
+        assert_eq!(count, 1, "{name} must appear exactly once");
+    }
+    let total = REDACTED_KEY_NAMES.len();
+    let unique: std::collections::HashSet<_> = REDACTED_KEY_NAMES.iter().collect();
+    assert_eq!(
+        total,
+        unique.len(),
+        "REDACTED_KEY_NAMES contains duplicate entries"
+    );
+}
+
+#[test]
+fn redact_secrets_redacts_together_api_key_assignment() {
+    let input = "TOGETHER_API_KEY=together_secret_value\n";
+    let out = redact_secrets(input);
+    assert!(out.contains("TOGETHER_API_KEY=[REDACTED_SECRET]"));
+    assert!(!out.contains("together_secret_value"));
+}
+
+#[test]
 fn redact_secrets_redacts_runtime_key_assignment() {
     let key_var = "JCODE_OPENAI_COMPAT_API_KEY_NAME";
     let prev = std::env::var(key_var).ok();

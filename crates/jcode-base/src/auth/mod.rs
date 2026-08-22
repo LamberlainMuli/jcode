@@ -401,6 +401,7 @@ impl AuthStatus {
             || self.copilot == AuthState::Available
             || self.antigravity == AuthState::Available
             || self.gemini == AuthState::Available
+            || self.cursor == AuthState::Available
             || self.grok_build == AuthState::Available
             || self.xai_oauth == AuthState::Available
     }
