@@ -342,6 +342,29 @@ impl MultiProvider {
             post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
+        // Cached OAuth logins must surface in /models on a fresh process,
+        // not only after an in-session login event fires handle_auth_changed.
+        {
+            let registry = ProviderRegistry::new(&result);
+            if crate::auth::grok_build::has_cached_login()
+                && registry.compatible_profile(GROK_BUILD_PROFILE_ID).is_none()
+                && let Some(grok) =
+                    external::instantiate_expected_external_provider(external::GROK_BUILD_RUNTIME)
+            {
+                crate::logging::info("Initialized Grok Build provider from cached login");
+                registry.install_compatible_profile(GROK_BUILD_PROFILE_ID, grok);
+            }
+            if crate::auth::xai_oauth::has_cached_login()
+                && registry.compatible_profile(XAI_OAUTH_PROFILE_ID).is_none()
+                && let Some(xai_oauth) = external::instantiate_expected_external_provider(
+                    external::XAI_OAUTH_RUNTIME,
+                )
+            {
+                crate::logging::info("Initialized SuperGrok provider from cached login");
+                registry.install_compatible_profile(XAI_OAUTH_PROFILE_ID, xai_oauth);
+            }
+        }
+
         // An explicit CLI/environment provider selection owns startup routing.
         // Applying the configured default model here can reactivate its configured
         // provider/profile before the caller pins a dual-auth credential mode.
