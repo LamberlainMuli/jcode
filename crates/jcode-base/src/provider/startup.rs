@@ -314,6 +314,11 @@ impl MultiProvider {
                         pref
                     ));
                 }
+            } else if super::subscription_runtime_profile_prefix(&pref).is_some() {
+                // Runtime-owned subscription profiles are not ActiveProvider
+                // keys; their routing is applied with the config default model
+                // below (set_config_default_model), so no slot preselection
+                // happens here.
             } else {
                 crate::logging::warn(&format!(
                     "Unknown default_provider '{}' in config (expected: claude|openai|copilot|antigravity|gemini|cursor|bedrock|openrouter or an OpenAI-compatible profile such as deepseek|comtegra|zai|openai-compatible)",

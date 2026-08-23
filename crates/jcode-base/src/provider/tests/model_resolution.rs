@@ -2433,3 +2433,137 @@ fn bare_openai_compatible_model_ids_route_to_their_profile_not_the_active_provid
         );
     });
 }
+
+/// A bare model id served by a runtime-owned subscription profile
+/// (`xai-oauth`, `grok-build`) must route to that runtime, not to the active
+/// provider. The catalog prefixes these routes (`xai-oauth:grok-4.6`), but
+/// hand-typed `/model grok-4.6` and restored sessions carry the bare id.
+#[test]
+fn bare_subscription_profile_model_ids_route_to_their_runtime_not_the_active_provider() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        let xai = Arc::new(StubExternalRuntime::new(
+            "xai-oauth",
+            "xAI Grok OAuth",
+            "xai-oauth-responses",
+            &["grok-4.6", "grok-4.5"],
+        )) as Arc<dyn Provider>;
+        let provider = MultiProvider {
+            claude: RwLock::new(None),
+            anthropic: RwLock::new(None),
+            openai: RwLock::new(None),
+            copilot_api: RwLock::new(None),
+            antigravity: RwLock::new(None),
+            gemini: RwLock::new(None),
+            cursor: RwLock::new(None),
+            bedrock: RwLock::new(None),
+            openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
+            active: RwLock::new(ActiveProvider::Copilot),
+            use_claude_cli: false,
+            startup_notices: RwLock::new(Vec::new()),
+            initial_provider: None,
+            routes_memo: std::sync::Mutex::new(None),
+            post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        ProviderRegistry::new(&provider).install_compatible_profile("xai-oauth", xai.clone());
+
+        provider
+            .set_model("grok-4.6")
+            .expect("bare SuperGrok model id should resolve to the xai-oauth runtime");
+        assert_eq!(provider.model(), "grok-4.6");
+    });
+}
+
+/// Regression: after a SuperGrok login the persisted config is
+/// `default_model = "grok-4.6"` (bare) + `default_provider = "xai-oauth"`.
+/// `xai-oauth` is neither an ActiveProvider key nor an OpenAI-compatible
+/// catalog profile, so startup dropped both and handed the bare id to
+/// whichever provider happened to be active (Copilot by auto-default),
+/// failing with "GitHub Copilot credentials not available".
+#[test]
+fn config_default_provider_xai_oauth_binds_supergrok_runtime() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        let xai = Arc::new(StubExternalRuntime::new(
+            "xai-oauth",
+            "xAI Grok OAuth",
+            "xai-oauth-responses",
+            &["grok-4.6", "grok-4.5"],
+        )) as Arc<dyn Provider>;
+        // Copilot active with no Copilot runtime reproduces the reported
+        // failure exactly; the default must never reach this slot.
+        let provider = MultiProvider {
+            claude: RwLock::new(None),
+            anthropic: RwLock::new(None),
+            openai: RwLock::new(None),
+            copilot_api: RwLock::new(None),
+            antigravity: RwLock::new(None),
+            gemini: RwLock::new(None),
+            cursor: RwLock::new(None),
+            bedrock: RwLock::new(None),
+            openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
+            active: RwLock::new(ActiveProvider::Copilot),
+            use_claude_cli: false,
+            startup_notices: RwLock::new(Vec::new()),
+            initial_provider: None,
+            routes_memo: std::sync::Mutex::new(None),
+            post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        ProviderRegistry::new(&provider).install_compatible_profile("xai-oauth", xai.clone());
+
+        provider
+            .set_config_default_model("grok-4.6", Some("xai-oauth"))
+            .expect("default_provider 'xai-oauth' should bind the SuperGrok runtime");
+        assert_eq!(provider.model(), "grok-4.6");
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(
+            ProviderRegistry::new(&provider).active_compatible_profile_id().as_deref(),
+            Some("xai-oauth"),
+        );
+    });
+}
+
+/// Session restore must rebuild the runtime-owned routing prefix from the
+/// persisted provider key / route api_method instead of emitting the bare id.
+#[test]
+fn subscription_route_restore_rebuilds_runtime_owned_prefix() {
+    assert_eq!(
+        MultiProvider::model_switch_request_for_session_route(
+            "grok-4.6",
+            Some("xai-oauth"),
+            Some("xai-oauth-responses"),
+        ),
+        "xai-oauth:grok-4.6"
+    );
+    // An already-prefixed spec must not be double-prefixed.
+    assert_eq!(
+        MultiProvider::model_switch_request_for_session_route(
+            "xai-oauth:grok-4.6",
+            Some("xai-oauth"),
+            Some("xai-oauth-responses"),
+        ),
+        "xai-oauth:grok-4.6"
+    );
+    assert_eq!(
+        MultiProvider::model_switch_request_for_session_route(
+            "grok-code-fast-1",
+            Some("grok-build"),
+            Some("grok-build-acp"),
+        ),
+        "grok-build:grok-code-fast-1"
+    );
+
+    let selection = MultiProvider::default_model_selection_from_route(
+        "xai-oauth:grok-4.6",
+        "xai-oauth-responses",
+        "xAI Grok OAuth",
+    );
+    assert_eq!(selection.provider_key.as_deref(), Some("xai-oauth"));
+    assert_eq!(selection.model_spec, "xai-oauth:grok-4.6");
+}

@@ -164,6 +164,12 @@ impl MultiProvider {
                     .unwrap_or_else(|| bare_name.to_string());
                 format!("{}@{}", model_id, provider_display)
             }
+            ModelRouteApiMethod::Other(method) => {
+                match super::subscription_runtime_prefix_for_api_method(method) {
+                    Some(prefix) => super::subscription_prefixed_spec(prefix, bare_name),
+                    None => bare_name.to_string(),
+                }
+            }
             _ => bare_name.to_string(),
         };
 
@@ -193,6 +199,9 @@ impl MultiProvider {
                 if method == "cli" && provider_display == "Antigravity" =>
             {
                 Some("antigravity".to_string())
+            }
+            ModelRouteApiMethod::Other(method) => {
+                super::subscription_runtime_prefix_for_api_method(method).map(str::to_string)
             }
             ModelRouteApiMethod::OpenRouter => Some("openrouter".to_string()),
             ModelRouteApiMethod::OpenAiCompatible { .. } => profile_id.clone(),
@@ -246,6 +255,15 @@ impl MultiProvider {
                 match prefix {
                     "copilot" | "antigravity" | "gemini" | "cursor" | "bedrock" | "openrouter" => {
                         return Some(prefix.to_string());
+                    }
+                    // Runtime-owned subscription profiles keep their own key so
+                    // a later restore rebuilds their routing prefix.
+                    _ if super::subscription_runtime_profile_prefix(prefix).is_some() => {
+                        return Some(
+                            super::subscription_runtime_profile_prefix(prefix)
+                                .unwrap()
+                                .to_string(),
+                        );
                     }
                     _ => {
                         if crate::provider_catalog::resolve_openai_compatible_profile_selection(
@@ -320,6 +338,8 @@ impl MultiProvider {
             "gemini" | "google" => "gemini",
             "antigravity" => "antigravity",
             "bedrock" | "aws bedrock" => "bedrock",
+            "xai grok oauth" | "xai-oauth" | "supergrok" => "xai-oauth",
+            "grok build" | "grok-build" => "grok-build",
             "" => return None,
             _ => return None,
         };
@@ -425,6 +445,12 @@ impl MultiProvider {
         let provider_key = Self::canonical_session_provider_key(provider_key);
 
         match provider_key {
+            // Runtime-owned subscription profiles route through their own
+            // prefix; a model id that already carries it passes verbatim.
+            key if super::subscription_runtime_profile_prefix(key).is_some() => {
+                let prefix = super::subscription_runtime_profile_prefix(key).unwrap_or(key);
+                super::subscription_prefixed_spec(prefix, model)
+            }
             "copilot" | "antigravity" | "gemini" | "cursor" | "bedrock" | "openrouter" => {
                 format!("{provider_key}:{model}")
             }
@@ -476,11 +502,17 @@ impl MultiProvider {
                 ModelRouteApiMethod::Cursor => return format!("cursor:{model}"),
                 ModelRouteApiMethod::Bedrock => return format!("bedrock:{model}"),
                 ModelRouteApiMethod::AntigravityHttps => return format!("antigravity:{model}"),
+                ModelRouteApiMethod::Other(method) => {
+                    if let Some(prefix) =
+                        super::subscription_runtime_prefix_for_api_method(&method)
+                    {
+                        return super::subscription_prefixed_spec(prefix, model);
+                    }
+                }
                 ModelRouteApiMethod::OpenAiCompatible { profile_id: None }
                 | ModelRouteApiMethod::CodeAssistOAuth
                 | ModelRouteApiMethod::RemoteCatalog
-                | ModelRouteApiMethod::Current
-                | ModelRouteApiMethod::Other(_) => {}
+                | ModelRouteApiMethod::Current => {}
             }
         }
 

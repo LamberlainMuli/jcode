@@ -10,6 +10,7 @@ ios_simulator_screenshot.png
 /.jcode/generated-images/
 /telemetry-worker/backups/
 target-ttest/
+target-xai-oauth/
 target-ttest*/
 
 # Offscreen frames written by `jcode-desktop2 --capture`. These are review

@@ -377,6 +377,13 @@ the tokens. It does **not** run `grok login` and never writes `~/.grok/auth.json
 - The Responses runtime factory is registered at process startup separately
   from this identity/login path
 
+### Persistence
+- Selecting a SuperGrok route as the default (model picker `Ctrl+O`, or
+  `/account` default-model) persists `default_provider = "xai-oauth"` and
+  restores it on every startup: jcode binds the cached-login runtime and
+  re-selects the saved model instead of falling back to whichever provider is
+  auto-detected. The same restore vocabulary covers `grok-build`.
+
 ## Google / Gmail OAuth
 
 ### Login steps

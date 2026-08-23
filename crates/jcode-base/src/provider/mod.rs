@@ -328,6 +328,69 @@ pub use self::state::{ProviderModelSelectionSource, ProviderRuntimeState, Provid
 pub(crate) const GROK_BUILD_PROFILE_ID: &str = "grok-build";
 pub(crate) const XAI_OAUTH_PROFILE_ID: &str = "xai-oauth";
 
+/// Runtime-owned subscription profiles that share the OpenRouter active slot
+/// but speak through their own routing prefix (`xai-oauth:`, `grok-build:`).
+/// They are neither [`ActiveProvider`] values nor OpenAI-compatible catalog
+/// profile ids, so every generic config-key/prefix resolver rejects them and
+/// each persistence boundary must map them explicitly.
+pub(crate) fn subscription_runtime_profile_prefix(key: &str) -> Option<&'static str> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "xai-oauth" | "supergrok" => Some(XAI_OAUTH_PROFILE_ID),
+        "grok-build" => Some(GROK_BUILD_PROFILE_ID),
+        _ => None,
+    }
+}
+
+/// Reverse mapping from a subscription runtime's route api_method to its
+/// routing prefix (`xai-oauth-responses` → `xai-oauth`).
+pub(crate) fn subscription_runtime_prefix_for_api_method(api_method: &str) -> Option<&'static str> {
+    match api_method.trim().to_ascii_lowercase().as_str() {
+        "xai-oauth-responses" => Some(XAI_OAUTH_PROFILE_ID),
+        "grok-build-acp" => Some(GROK_BUILD_PROFILE_ID),
+        _ => None,
+    }
+}
+
+/// Spec for a subscription-profile route: keep an already-prefixed model id
+/// verbatim (catalog routes carry `xai-oauth:<model>`), otherwise attach the
+/// prefix to the bare id.
+pub(crate) fn subscription_prefixed_spec(prefix: &str, model: &str) -> String {
+    if model.starts_with(&format!("{prefix}:")) {
+        model.to_string()
+    } else {
+        format!("{prefix}:{model}")
+    }
+}
+/// Find a runtime-owned subscription profile whose live routes serve this
+/// bare model id. The active profile wins when several serve it.
+pub(crate) fn subscription_runtime_profile_owning_model(
+    provider: &MultiProvider,
+    model: &str,
+) -> Option<&'static str> {
+    let active_profile_id = ProviderRegistry::new(provider).active_compatible_profile_id();
+    let mut fallback: Option<&'static str> = None;
+    for route in provider.fresh_routes_memo_entry().routes {
+        if !route.available {
+            continue;
+        }
+        let Some(prefix) = subscription_runtime_prefix_for_api_method(&route.api_method) else {
+            continue;
+        };
+        // Catalog routes carry the runtime prefix (`xai-oauth:<model>`);
+        // accept both that form and the bare id.
+        if route.model != model && route.model != format!("{prefix}:{model}") {
+            continue;
+        }
+        if active_profile_id.as_deref() == Some(prefix) {
+            return Some(prefix);
+        }
+        if fallback.is_none() {
+            fallback = Some(prefix);
+        }
+    }
+    fallback
+}
+
 /// MultiProvider wraps multiple providers and allows seamless model switching
 pub struct MultiProvider {
     /// Claude Code CLI provider
@@ -1668,6 +1731,21 @@ impl MultiProvider {
             );
         }
 
+        // Runtime-owned subscription profiles (`xai-oauth`, `grok-build`) are
+        // neither ActiveProvider keys nor catalog profile ids, so
+        // resolve_config_provider_selection rejects them above. A persisted
+        // `default_provider = "xai-oauth"` with a bare `default_model` must
+        // still reach the owning runtime instead of falling through to global
+        // model-name heuristics (which route unknown ids to whichever provider
+        // is active at startup).
+        if let Some(pref) = default_provider
+            .map(str::trim)
+            .filter(|pref| !pref.is_empty())
+            && let Some(prefix) = subscription_runtime_profile_prefix(pref)
+        {
+            return self.set_model(&subscription_prefixed_spec(prefix, model));
+        }
+
         self.set_model(model)
     }
 
@@ -1703,6 +1781,16 @@ impl MultiProvider {
             ActiveProvider::Cursor => "cursor",
             ActiveProvider::Bedrock => "bedrock",
             ActiveProvider::OpenRouter => {
+                // A runtime-owned subscription profile owns the slot: fork
+                // specs must carry its prefix, not the generic openrouter one.
+                if let Some(profile_id) = ProviderRegistry::new(self)
+                    .active_compatible_profile_id()
+                    .and_then(|profile_id| {
+                        subscription_runtime_profile_prefix(&profile_id).map(|_| profile_id)
+                    })
+                {
+                    return format!("{profile_id}:{current_model}");
+                }
                 if let Some(openrouter) = self.active_openrouter_execution_provider()
                     && let Some((_provider, api_method, _detail)) =
                         openrouter.direct_openai_compatible_route_parts()
@@ -2136,11 +2224,19 @@ impl Provider for MultiProvider {
             // whichever provider happened to be active and failed with a
             // misleading "not supported by <active provider>" error.
             self.set_model_on_openai_compatible_profile(profile, model)
+        } else if let Some(prefix) = subscription_runtime_profile_owning_model(self, model) {
+            // Bare ids served by a runtime-owned subscription profile
+            // (`xai-oauth`, `grok-build`) match no built-in heuristic and are
+            // invisible to the OpenAI-compatible ownership lookup (their
+            // api_method is not `openai-compatible:<id>`). Route them to the
+            // owning runtime instead of the active provider.
+            self.set_model(&subscription_prefixed_spec(prefix, model))
         } else {
             // Unknown model - try current provider.
             self.set_model_on_provider(self.active_provider(), model)
         }
     }
+
 
     fn set_route_selection(&self, selection: &RouteSelection) -> Result<()> {
         if selection.model.trim().is_empty() {
