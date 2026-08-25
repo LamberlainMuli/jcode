@@ -10,9 +10,10 @@ use jcode_base::auth::antigravity as antigravity_auth;
 use jcode_message_types::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
 use jcode_provider_antigravity::{
     AVAILABLE_MODELS, CatalogModel, CatalogSnapshot, DEFAULT_FALLBACK_MODEL,
-    GENERATE_CONTENT_API_URL, PersistedCatalog, X_GOOG_API_CLIENT, antigravity_compatible_schema,
-    antigravity_user_agent, catalog_is_stale, catalog_model_detail, client_metadata_header,
-    is_retryable_empty_turn, merge_antigravity_model_ids, remap_unsupported_model,
+    GENERATE_CONTENT_PATH, PersistedCatalog, X_GOOG_API_CLIENT, antigravity_base_url_candidates,
+    antigravity_compatible_schema, antigravity_retryable_status, antigravity_user_agent,
+    catalog_is_stale, catalog_model_detail, client_metadata_header, is_retryable_empty_turn,
+    merge_antigravity_model_ids, remap_unsupported_model,
 };
 #[cfg(test)]
 use jcode_provider_antigravity::{
@@ -401,37 +402,51 @@ impl AntigravityProvider {
             ],
         );
 
-        let response = self
-            .client
-            .post(GENERATE_CONTENT_API_URL)
-            .bearer_auth(&tokens.access_token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, antigravity_user_agent())
-            .header("x-goog-api-client", X_GOOG_API_CLIENT)
-            .header(
-                "x-goog-request-params",
-                format!("project={}", request.project),
-            )
-            .header("x-goog-client-metadata", client_metadata_header())
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send Antigravity generateContent request")?;
+        let mut last_error = None;
+        for base_url in antigravity_base_url_candidates() {
+            let response = match self
+                .client
+                .post(format!("{}{}", base_url, GENERATE_CONTENT_PATH))
+                .bearer_auth(&tokens.access_token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, antigravity_user_agent())
+                .header("x-goog-api-client", X_GOOG_API_CLIENT)
+                .header(
+                    "x-goog-request-params",
+                    format!("project={}", request.project),
+                )
+                .header("x-goog-client-metadata", client_metadata_header())
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(format!("{}: {}", base_url, error));
+                    continue;
+                }
+            };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-            anyhow::bail!(
-                "Antigravity generateContent failed (HTTP {}): {}",
-                status,
-                body.trim()
-            );
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = jcode_base::util::http_error_body(response, "HTTP error").await;
+                last_error = Some(format!("HTTP {}: {}", status, body.trim()));
+                if antigravity_retryable_status(status.as_u16()) {
+                    continue;
+                }
+                break;
+            }
+
+            return response
+                .json()
+                .await
+                .context("Failed to decode Antigravity generateContent response");
         }
 
-        response
-            .json()
-            .await
-            .context("Failed to decode Antigravity generateContent response")
+        anyhow::bail!(
+            "Antigravity generateContent failed across all endpoints: {}",
+            last_error.unwrap_or_else(|| "no response".to_string())
+        )
     }
 }
 

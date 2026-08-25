@@ -19,13 +19,50 @@ pub const AVAILABLE_MODELS: &[&str] = &[
     "gpt-oss-120b-medium",
 ];
 pub const FETCH_MODELS_API_URL: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 pub const GENERATE_CONTENT_API_URL: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
+pub const FETCH_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
+pub const GENERATE_CONTENT_PATH: &str = "/v1internal:generateContent";
+pub const ANTIGRAVITY_DAILY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+pub const ANTIGRAVITY_DAILY_SANDBOX_BASE_URL: &str =
+    "https://daily-cloudcode-pa.sandbox.googleapis.com";
+pub const ANTIGRAVITY_PROD_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
 const VERSION_ENV: &str = "JCODE_ANTIGRAVITY_VERSION";
+const BASE_URL_ENV: &str = "JCODE_ANTIGRAVITY_BASE_URL";
 pub const ANTIGRAVITY_VERSION: &str = "1.18.3";
 pub const X_GOOG_API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
 const CATALOG_REFRESH_TTL_HOURS: i64 = 6;
+
+/// Return Antigravity endpoints in consumer-safe priority order.
+///
+/// Personal Google accounts are served by the daily Cloud Code backend. The
+/// production endpoint can return RESOURCE_EXHAUSTED for those same accounts
+/// even when the native Antigravity app and daily backend work. Keep production
+/// as a final compatibility fallback for enterprise/GCP-managed accounts.
+pub fn antigravity_base_url_candidates() -> Vec<String> {
+    if let Ok(value) = std::env::var(BASE_URL_ENV) {
+        let value = value.trim().trim_end_matches('/');
+        if matches!(
+            value,
+            ANTIGRAVITY_DAILY_BASE_URL
+                | ANTIGRAVITY_DAILY_SANDBOX_BASE_URL
+                | ANTIGRAVITY_PROD_BASE_URL
+        ) {
+            return vec![value.to_string()];
+        }
+    }
+
+    vec![
+        ANTIGRAVITY_DAILY_BASE_URL.to_string(),
+        ANTIGRAVITY_DAILY_SANDBOX_BASE_URL.to_string(),
+        ANTIGRAVITY_PROD_BASE_URL.to_string(),
+    ]
+}
+
+pub fn antigravity_retryable_status(status: u16) -> bool {
+    matches!(status, 403 | 404 | 429 | 500 | 502 | 503 | 504)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PersistedCatalog {
