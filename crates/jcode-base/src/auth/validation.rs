@@ -58,6 +58,30 @@ pub fn format_record_label(record: &ProviderValidationRecord) -> String {
     format!("{} ({})", base, age)
 }
 
+/// Whether a validation failure summary describes a quota / rate-limit
+/// condition rather than an authentication problem.
+///
+/// A transient HTTP 429 `RESOURCE_EXHAUSTED` / "Too Many Requests" / quota
+/// exhausted response says nothing about the credential: the token can be
+/// perfectly valid and auto-refreshable while the backend simply has no
+/// capacity right now. Persisting such a run as `success: false` made auth
+/// status report "validation failed" indefinitely, which pushed users into
+/// pointless re-logins and gated model selection even though the stored
+/// OAuth token was healthy. Callers use this to avoid overwriting a previous
+/// record with a quota-shaped failure.
+pub fn summary_is_quota_limited(summary: &str) -> bool {
+    let lowered = summary.to_ascii_lowercase();
+    lowered.contains("429")
+        || lowered.contains("resource_exhausted")
+        || lowered.contains("resource has been exhausted")
+        || lowered.contains("too many requests")
+        || lowered.contains("rate limit")
+        || lowered.contains("rate_limit")
+        || lowered.contains("ratelimit")
+        || lowered.contains("quota exceeded")
+        || lowered.contains("quota exhausted")
+}
+
 fn age_label(checked_at_ms: i64) -> String {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let delta_ms = now_ms.saturating_sub(checked_at_ms).max(0);
@@ -133,5 +157,36 @@ mod tests {
             "stale-but-passing record should keep its verdict prefix: {label}"
         );
         assert!(label.contains("stale"), "stale label missing: {label}");
+    }
+
+    #[test]
+    fn quota_limited_summaries_are_detected() {
+        let quota_summaries = [
+            "provider_smoke: antigravity provider smoke prompt failed: Antigravity generateContent failed (HTTP 429 Too Many Requests)",
+            "provider_smoke: RESOURCE_EXHAUSTED quota exhausted",
+            "provider_smoke: rate limit reached",
+            "provider_smoke: Quota Exceeded for today",
+        ];
+        for summary in quota_summaries {
+            assert!(
+                summary_is_quota_limited(summary),
+                "should classify as quota-limited: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_failures_are_not_quota_limited() {
+        let auth_summaries = [
+            "provider_smoke: HTTP 401 Unauthorized invalid credentials",
+            "provider_smoke: HTTP 403 Forbidden permission denied",
+            "provider_smoke: invalid_grant token expired",
+        ];
+        for summary in auth_summaries {
+            assert!(
+                !summary_is_quota_limited(summary),
+                "must not classify as quota-limited: {summary}"
+            );
+        }
     }
 }

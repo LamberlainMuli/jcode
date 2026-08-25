@@ -11,9 +11,7 @@ async fn maybe_run_auth_test_smoke(
         // Cursor native agent transport is text-only (no tool calls over
         // agent.v1.AgentService/Run), so skip the tool smoke with an
         // explanation instead of hanging waiting for a tool call.
-        if matches!(kind, AuthTestSmokeKind::Tool)
-            && matches!(target, AuthTestTarget::Cursor)
-        {
+        if matches!(kind, AuthTestSmokeKind::Tool) && matches!(target, AuthTestTarget::Cursor) {
             report.push_step(
                 kind.step_name(),
                 true,
@@ -699,6 +697,18 @@ fn persist_auth_test_report(report: &AuthTestProviderReport, model: Option<&str>
         tool_smoke_ok: step_map.get("tool_smoke").copied(),
         summary,
     };
+
+    // A quota/rate-limit-shaped failure is not an auth problem: the stored
+    // credential can be perfectly healthy while the backend is out of
+    // capacity. Persisting it as a failed validation would make auth status
+    // demand a re-login indefinitely, so keep the previous record instead.
+    if !record.success && crate::auth::validation::summary_is_quota_limited(&record.summary) {
+        crate::logging::info(&format!(
+            "auth validation for {} hit a quota/rate limit; keeping previous record instead of recording a failure: {}",
+            report.provider, record.summary
+        ));
+        return;
+    }
 
     if let Err(err) = crate::auth::validation::save(&report.provider, record) {
         crate::logging::warn(&format!(

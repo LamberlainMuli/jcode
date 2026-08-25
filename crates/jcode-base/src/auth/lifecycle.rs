@@ -234,10 +234,9 @@ pub fn provider_model_to_select_after_auth_with_configured_default(
                 && route.model == configured
                 && route_matches_activation(route, activation)
         })
+        && selected_model.map(str::trim) != Some(configured)
     {
-        if selected_model.map(str::trim) != Some(configured) {
-            return Some(configured.to_string());
-        }
+        return Some(configured.to_string());
     }
 
     provider_model_to_select_after_auth(activation, selected_model, routes)
@@ -901,6 +900,7 @@ fn normalized_login_provider_id(provider_id: &str) -> Option<&'static str> {
         "gemini" => Some("gemini"),
         "antigravity" => Some("antigravity"),
         "xai-oauth" | "supergrok" => Some("xai-oauth"),
+        "grok-build" => Some("grok-build"),
         _ => None,
     }
 }
