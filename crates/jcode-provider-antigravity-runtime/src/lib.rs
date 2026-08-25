@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use jcode_base::auth::antigravity as antigravity_auth;
 use jcode_message_types::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
 use jcode_provider_antigravity::{
-    AVAILABLE_MODELS, CatalogModel, CatalogSnapshot, DEFAULT_FALLBACK_MODEL,
-    GENERATE_CONTENT_PATH, PersistedCatalog, X_GOOG_API_CLIENT, antigravity_base_url_candidates,
+    AVAILABLE_MODELS, CatalogModel, CatalogSnapshot, DEFAULT_FALLBACK_MODEL, GENERATE_CONTENT_PATH,
+    PersistedCatalog, X_GOOG_API_CLIENT, antigravity_base_url_candidates,
     antigravity_compatible_schema, antigravity_retryable_status, antigravity_user_agent,
     catalog_is_stale, catalog_model_detail, client_metadata_header, is_retryable_empty_turn,
     merge_antigravity_model_ids, remap_unsupported_model,
