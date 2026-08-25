@@ -314,7 +314,7 @@ impl MultiProvider {
                         pref
                     ));
                 }
-            } else if super::subscription_runtime_profile_prefix(&pref).is_some() {
+            } else if super::subscription_runtime_profile_prefix(pref).is_some() {
                 // Runtime-owned subscription profiles are not ActiveProvider
                 // keys; their routing is applied with the config default model
                 // below (set_config_default_model), so no slot preselection
@@ -361,9 +361,8 @@ impl MultiProvider {
             }
             if crate::auth::xai_oauth::has_cached_login()
                 && registry.compatible_profile(XAI_OAUTH_PROFILE_ID).is_none()
-                && let Some(xai_oauth) = external::instantiate_expected_external_provider(
-                    external::XAI_OAUTH_RUNTIME,
-                )
+                && let Some(xai_oauth) =
+                    external::instantiate_expected_external_provider(external::XAI_OAUTH_RUNTIME)
             {
                 crate::logging::info("Initialized SuperGrok provider from cached login");
                 registry.install_compatible_profile(XAI_OAUTH_PROFILE_ID, xai_oauth);

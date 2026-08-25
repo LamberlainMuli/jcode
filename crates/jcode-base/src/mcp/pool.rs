@@ -430,13 +430,15 @@ mod tests {
 
     #[tokio::test]
     async fn issue_790_reload_reuses_default_config_directory() {
-        let _guard = crate::storage::lock_test_env();
         let original_cwd = std::env::current_dir().expect("current cwd");
         let previous_home = std::env::var_os("JCODE_HOME");
         let home = tempfile::tempdir().expect("home tempdir");
         let first_project = tempfile::tempdir().expect("first project tempdir");
         let second_project = tempfile::tempdir().expect("second project tempdir");
-        crate::env::set_var("JCODE_HOME", home.path());
+        {
+            let _guard = crate::storage::lock_test_env();
+            crate::env::set_var("JCODE_HOME", home.path());
+        }
         std::fs::write(
             first_project.path().join(".mcp.json"),
             r#"{"mcpServers":{"first":{"command":"first-server","shared":false}}}"#,

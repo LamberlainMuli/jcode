@@ -503,8 +503,7 @@ impl MultiProvider {
                 ModelRouteApiMethod::Bedrock => return format!("bedrock:{model}"),
                 ModelRouteApiMethod::AntigravityHttps => return format!("antigravity:{model}"),
                 ModelRouteApiMethod::Other(method) => {
-                    if let Some(prefix) =
-                        super::subscription_runtime_prefix_for_api_method(&method)
+                    if let Some(prefix) = super::subscription_runtime_prefix_for_api_method(&method)
                     {
                         return super::subscription_prefixed_spec(prefix, model);
                     }

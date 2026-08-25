@@ -113,19 +113,16 @@ pub fn reconcile_xai_oauth_tool_choice(tool_choice: &mut Value, tools: &[Value])
         *tool_choice = Value::Null;
         return;
     }
-    match tool_choice {
-        Value::Object(map) => {
-            let forced_name = map.get("name").and_then(Value::as_str).map(str::to_string);
-            if let Some(name) = forced_name {
-                let survives = tools
-                    .iter()
-                    .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name.as_str()));
-                if !survives {
-                    *tool_choice = Value::Null;
-                }
+    if let Value::Object(map) = tool_choice {
+        let forced_name = map.get("name").and_then(Value::as_str).map(str::to_string);
+        if let Some(name) = forced_name {
+            let survives = tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name.as_str()));
+            if !survives {
+                *tool_choice = Value::Null;
             }
         }
-        _ => {}
     }
 }
 

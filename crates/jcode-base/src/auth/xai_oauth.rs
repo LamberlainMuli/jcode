@@ -177,9 +177,7 @@ pub fn can_refresh_stored_credentials() -> bool {
     })
 }
 
-pub async fn load_or_refresh_credentials(
-    client: &reqwest::Client,
-) -> Result<XaiOauthCredentials> {
+pub async fn load_or_refresh_credentials(client: &reqwest::Client) -> Result<XaiOauthCredentials> {
     let credentials = load_credentials()?;
     if !credentials.is_expired() {
         return Ok(credentials);
@@ -357,6 +355,9 @@ fn jwt_claims(access_token: &str) -> JwtClaims {
 }
 
 #[cfg(test)]
+// Env-mutating async tests must hold the shared test-env lock across awaits
+// to stay isolated from parallel tests; that pattern is intentional here.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::ffi::{OsStr, OsString};
@@ -404,7 +405,10 @@ mod tests {
         (temp, home, oauth, api_key, token_url)
     }
 
-    async fn mock_token_server(status: u16, response_body: &str) -> (u16, tokio::task::JoinHandle<String>) {
+    async fn mock_token_server(
+        status: u16,
+        response_body: &str,
+    ) -> (u16, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let resp_body = response_body.to_string();
@@ -618,14 +622,17 @@ mod tests {
         };
 
         // Another task refreshed to a new, unexpired token: short-circuit.
-        assert!(reloaded_credentials_fresh(Some(&observed), &rotated_unexpired));
+        assert!(reloaded_credentials_fresh(
+            Some(&observed),
+            &rotated_unexpired
+        ));
         // Rotated but still expired: must NOT count as already refreshed.
-        assert!(!reloaded_credentials_fresh(Some(&observed), &rotated_expired));
-        // Same token we observed (no concurrent refresh): keep refreshing.
         assert!(!reloaded_credentials_fresh(
             Some(&observed),
-            &observed
+            &rotated_expired
         ));
+        // Same token we observed (no concurrent refresh): keep refreshing.
+        assert!(!reloaded_credentials_fresh(Some(&observed), &observed));
         // Nothing was stored when the caller looked: keep refreshing.
         assert!(!reloaded_credentials_fresh(None, &rotated_unexpired));
     }

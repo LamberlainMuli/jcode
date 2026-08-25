@@ -266,9 +266,7 @@ async fn stream_xai_oauth_response(
                 Err(error) => {
                     let status = response.status();
                     let body = jcode_provider_core::http_error_body(response, "xai-oauth").await;
-                    anyhow::bail!(
-                        "xai-oauth API error {status}: {body} (refresh failed: {error})"
-                    );
+                    anyhow::bail!("xai-oauth API error {status}: {body} (refresh failed: {error})");
                 }
             }
         }
@@ -497,7 +495,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn identity_defaults() {
         let provider = XaiOauthProvider::new();
@@ -614,7 +611,8 @@ mod tests {
         })
         .unwrap();
 
-        let token_body = r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
+        let token_body =
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
         let sse_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[]}}\n\n";
         let port = serve_http_sequence(vec![
             (401, "application/json", r#"{"error":"invalid_token"}"#),
@@ -642,13 +640,7 @@ mod tests {
         .expect("401 should refresh and retry");
 
         let first = rx.recv().await.expect("connection event");
-        assert!(matches!(
-            first,
-            Ok(StreamEvent::ConnectionType { .. })
-        ));
-        assert_eq!(
-            load_credentials().unwrap().access_token,
-            "new-access"
-        );
+        assert!(matches!(first, Ok(StreamEvent::ConnectionType { .. })));
+        assert_eq!(load_credentials().unwrap().access_token, "new-access");
     }
 }

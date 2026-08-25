@@ -399,8 +399,6 @@ fn emit_completions_tool_end(
         if let Some(event) = emit_completions_tool_start(call, extra, pending) {
             pending.push_front(event);
         }
-    }
-    if !call.started {
         return None;
     }
     if call.streamed_arg_len < call.arguments.len() {
@@ -588,6 +586,7 @@ pub fn parse_openai_response_event(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn parse_openai_response_event_with_mode(
     data: &str,
     saw_text_delta: &mut bool,

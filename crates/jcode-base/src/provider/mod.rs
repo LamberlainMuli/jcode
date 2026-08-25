@@ -2237,7 +2237,6 @@ impl Provider for MultiProvider {
         }
     }
 
-
     fn set_route_selection(&self, selection: &RouteSelection) -> Result<()> {
         if selection.model.trim().is_empty() {
             anyhow::bail!("Model cannot be empty");
