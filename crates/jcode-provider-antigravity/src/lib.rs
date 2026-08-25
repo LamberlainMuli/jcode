@@ -499,6 +499,10 @@ pub fn is_pseudo_tool_call_turn(response: &CodeAssistGenerateResponse) -> bool {
 /// model instead of a hard 400.
 pub fn remap_unsupported_model(model: &str) -> &str {
     match model {
+        // Pi exposes this friendly alias while routing it to the consumer
+        // account's tiered backend model. Keep the same public name working in
+        // Jcode instead of sending an ID that is absent from the live catalog.
+        "gemini-3.7-flash" => "gemini-3.7-flash-tiered",
         "gemini-3.1-pro-high" => "gemini-pro-agent",
         other => other,
     }
@@ -613,5 +617,31 @@ pub fn flatten_schema_combiners(schema: &Value) -> Value {
         }
         Value::Array(items) => Value::Array(items.iter().map(flatten_schema_combiners).collect()),
         _ => schema.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{antigravity_retryable_status, remap_unsupported_model};
+
+    #[test]
+    fn gemini_37_flash_alias_routes_to_live_tiered_model() {
+        assert_eq!(
+            remap_unsupported_model("gemini-3.7-flash"),
+            "gemini-3.7-flash-tiered"
+        );
+        assert_eq!(
+            remap_unsupported_model("gemini-3.7-flash-tiered"),
+            "gemini-3.7-flash-tiered"
+        );
+    }
+
+    #[test]
+    fn consumer_endpoint_failures_are_retryable() {
+        for status in [403, 404, 429, 500, 502, 503, 504] {
+            assert!(antigravity_retryable_status(status), "status {status}");
+        }
+        assert!(!antigravity_retryable_status(400));
+        assert!(!antigravity_retryable_status(401));
     }
 }
