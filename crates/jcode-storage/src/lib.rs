@@ -94,23 +94,70 @@ pub use active_pids::{
 /// - Fallback: `std::env::temp_dir()`
 ///
 /// Can be overridden with `$JCODE_RUNTIME_DIR`.
+///
+/// Inherited variables (`XDG_RUNTIME_DIR`, macOS `TMPDIR`) are only trusted
+/// when they point at an existing directory. Containerized and non-login
+/// environments (website containers, cron, `su` sessions) frequently inherit a
+/// stale `XDG_RUNTIME_DIR` such as `/run/user/<uid>` without the directory
+/// being provisioned inside the container. Trusting it blindly made the daemon
+/// fail at socket/lock creation with a confusing `No such file or directory
+/// (os error 2)`, so an unusable inherited directory falls back to the
+/// temporary runtime directory instead. An explicitly configured
+/// `JCODE_RUNTIME_DIR` is created when missing and only falls back when it
+/// cannot be provisioned at all.
 pub fn runtime_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("JCODE_RUNTIME_DIR") {
-        return PathBuf::from(dir);
+        let path = PathBuf::from(dir);
+        if usable_runtime_dir(&path) || std::fs::create_dir_all(&path).is_ok() {
+            return path;
+        }
+        warn_runtime_dir_unusable("JCODE_RUNTIME_DIR", &path, "could not be created");
     }
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir);
+        let path = PathBuf::from(dir);
+        if usable_runtime_dir(&path) {
+            return path;
+        }
+        warn_runtime_dir_unusable("XDG_RUNTIME_DIR", &path, "is missing or not a directory");
     }
     #[cfg(target_os = "macos")]
     {
         if let Ok(dir) = std::env::var("TMPDIR") {
-            return PathBuf::from(dir);
+            let path = PathBuf::from(dir);
+            if usable_runtime_dir(&path) {
+                return path;
+            }
+            warn_runtime_dir_unusable("TMPDIR", &path, "is missing or not a directory");
         }
     }
 
     let dir = fallback_runtime_dir();
     ensure_private_runtime_dir(&dir);
     dir
+}
+
+/// A runtime directory is usable only when it already exists and is a
+/// directory. Containers can inherit a set-but-missing `XDG_RUNTIME_DIR`, so
+/// existence is verified before the value is trusted.
+fn usable_runtime_dir(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
+/// Warn once per process when a configured runtime directory cannot be used.
+fn warn_runtime_dir_unusable(var: &str, path: &Path, reason: &str) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WARNED.set(()).is_err() {
+        return;
+    }
+    eprintln!(
+        "warning: {} {} ({}); using {} instead",
+        var,
+        path.display(),
+        reason,
+        fallback_runtime_dir().display()
+    );
 }
 
 fn fallback_runtime_dir() -> PathBuf {
@@ -742,6 +789,136 @@ mod windows_hardening_tests {
 
         assert!(!state.enqueue(&file, false, now));
         assert!(state.pending_files.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod runtime_dir_tests {
+    use super::*;
+
+    /// Environment mutation is process-global, so tests that touch runtime
+    /// resolution env vars must not run concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RuntimeEnvGuard {
+        jcode_runtime: Option<std::ffi::OsString>,
+        xdg_runtime: Option<std::ffi::OsString>,
+    }
+
+    impl RuntimeEnvGuard {
+        fn set(jcode_runtime: Option<&Path>, xdg_runtime: Option<&Path>) -> Self {
+            let guard = Self {
+                jcode_runtime: std::env::var_os("JCODE_RUNTIME_DIR"),
+                xdg_runtime: std::env::var_os("XDG_RUNTIME_DIR"),
+            };
+            match jcode_runtime {
+                Some(path) => jcode_core::env::set_var("JCODE_RUNTIME_DIR", path),
+                None => jcode_core::env::remove_var("JCODE_RUNTIME_DIR"),
+            }
+            match xdg_runtime {
+                Some(path) => jcode_core::env::set_var("XDG_RUNTIME_DIR", path),
+                None => jcode_core::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            guard
+        }
+    }
+
+    impl Drop for RuntimeEnvGuard {
+        fn drop(&mut self) {
+            match &self.jcode_runtime {
+                Some(value) => jcode_core::env::set_var("JCODE_RUNTIME_DIR", value),
+                None => jcode_core::env::remove_var("JCODE_RUNTIME_DIR"),
+            }
+            match &self.xdg_runtime {
+                Some(value) => jcode_core::env::set_var("XDG_RUNTIME_DIR", value),
+                None => jcode_core::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn uses_existing_xdg_runtime_dir() {
+        let _env = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let _guard = RuntimeEnvGuard::set(None, Some(temp.path()));
+
+        assert_eq!(runtime_dir(), temp.path());
+    }
+
+    #[test]
+    fn falls_back_when_xdg_runtime_dir_does_not_exist() {
+        let _env = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("does-not-exist");
+        let _guard = RuntimeEnvGuard::set(None, Some(&missing));
+
+        let result = runtime_dir();
+
+        assert_ne!(result, missing);
+        assert!(result.exists());
+        assert_eq!(result, fallback_runtime_dir());
+    }
+
+    #[test]
+    fn falls_back_when_xdg_runtime_dir_points_at_a_file() {
+        let _env = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = temp.path().join("not-a-dir");
+        std::fs::write(&file, b"").expect("write file");
+        let _guard = RuntimeEnvGuard::set(None, Some(&file));
+
+        let result = runtime_dir();
+
+        assert_ne!(result, file);
+        assert!(result.exists());
+    }
+
+    #[test]
+    fn empty_xdg_runtime_dir_falls_back() {
+        let _env = ENV_LOCK.lock().expect("env lock");
+        let _guard = RuntimeEnvGuard::set(None, Some(Path::new("")));
+
+        assert_eq!(runtime_dir(), fallback_runtime_dir());
+    }
+
+    #[test]
+    fn explicit_runtime_dir_is_created_when_missing() {
+        let _env = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("nested").join("runtime");
+        assert!(!missing.exists());
+        let _guard = RuntimeEnvGuard::set(Some(&missing), None);
+
+        assert_eq!(runtime_dir(), missing);
+        assert!(missing.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn falls_back_when_explicit_runtime_dir_cannot_be_created() {
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses directory permissions, so the creation failure
+            // this test relies on cannot be reproduced.
+            return;
+        }
+        let _env = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let blocked = temp.path().join("blocked");
+        std::fs::create_dir(&blocked).expect("create dir");
+        let mut perms = std::fs::metadata(&blocked).expect("metadata").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&blocked, perms).expect("drop write permission");
+        let _guard = RuntimeEnvGuard::set(Some(&blocked.join("runtime")), None);
+
+        let result = runtime_dir();
+
+        // Restore permissions so the tempdir can clean itself up.
+        let mut perms = std::fs::metadata(&blocked).expect("metadata").permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(&blocked, perms);
+
+        assert_eq!(result, fallback_runtime_dir());
     }
 }
 
