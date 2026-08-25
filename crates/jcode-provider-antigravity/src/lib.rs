@@ -18,6 +18,11 @@ pub const AVAILABLE_MODELS: &[&str] = &[
     "gemini-3.5-flash-low",
     "gpt-oss-120b-medium",
 ];
+
+/// Public alias ids Jcode accepts in addition to backend catalog ids. Each maps
+/// onto a live catalog model via [`remap_unsupported_model`] at request time,
+/// so pickers and validators must accept them as selectable models too.
+pub const MODEL_ALIASES: &[(&str, &str)] = &[("gemini-3.7-flash", "gemini-3.7-flash-tiered")];
 pub const FETCH_MODELS_API_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 pub const GENERATE_CONTENT_API_URL: &str =
@@ -360,6 +365,32 @@ pub fn parse_fetch_available_models_response(
             })
         })
         .collect();
+
+    // Public aliases (e.g. `gemini-3.7-flash`) are selectable ids that route
+    // onto a live backend catalog model at request time. Mirror each alias as
+    // a catalog entry whenever its target is live, so pickers, doctor checks,
+    // and /usage see the same selectable surface users can actually request.
+    let mut aliases: Vec<CatalogModel> = Vec::new();
+    for (alias, target) in MODEL_ALIASES {
+        if models.iter().any(|model| model.id == *alias) {
+            continue;
+        }
+        if let Some(target_model) = models.iter().find(|model| model.id == *target) {
+            aliases.push(CatalogModel {
+                id: alias.to_string(),
+                display_name: target_model.display_name.clone(),
+                reset_time: target_model.reset_time.clone(),
+                tag_title: target_model.tag_title.clone(),
+                model_provider: target_model.model_provider.clone(),
+                max_tokens: target_model.max_tokens,
+                max_output_tokens: target_model.max_output_tokens,
+                recommended: target_model.recommended,
+                available: target_model.available,
+                remaining_fraction_milli: target_model.remaining_fraction_milli,
+            });
+        }
+    }
+    models.extend(aliases);
     models.sort_by_key(|model| !model.available);
     CatalogSnapshot {
         models,

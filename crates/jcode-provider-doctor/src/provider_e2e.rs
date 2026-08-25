@@ -1124,7 +1124,14 @@ pub async fn run_antigravity_native_e2e(
     let default_model = runtime.model();
     let selected = match requested_model.map(str::trim).filter(|m| !m.is_empty()) {
         Some(model) => {
-            if tier.requires_api_key() && !catalog_models.iter().any(|m| m == model) {
+            let resolves_to_catalog_model =
+                jcode_provider_antigravity::remap_unsupported_model(model);
+            if tier.requires_api_key()
+                && !catalog_models.iter().any(|m| m == model)
+                && !catalog_models
+                    .iter()
+                    .any(|m| m == &resolves_to_catalog_model.to_string())
+            {
                 checks.push(DoctorCheck::failed(
                     checkpoints::MODEL_CATALOG_LIVE_ENDPOINT,
                     label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),

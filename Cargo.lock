@@ -4060,6 +4060,7 @@ dependencies = [
  "futures",
  "jcode-base",
  "jcode-provider-anthropic-runtime",
+ "jcode-provider-antigravity",
  "jcode-provider-antigravity-runtime",
  "jcode-provider-copilot-runtime",
  "jcode-provider-cursor-runtime",

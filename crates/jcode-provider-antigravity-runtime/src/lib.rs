@@ -10,7 +10,7 @@ use jcode_base::auth::antigravity as antigravity_auth;
 use jcode_message_types::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
 use jcode_provider_antigravity::{
     AVAILABLE_MODELS, CatalogModel, CatalogSnapshot, DEFAULT_FALLBACK_MODEL, GENERATE_CONTENT_PATH,
-    PersistedCatalog, X_GOOG_API_CLIENT, antigravity_base_url_candidates,
+    MODEL_ALIASES, PersistedCatalog, X_GOOG_API_CLIENT, antigravity_base_url_candidates,
     antigravity_compatible_schema, antigravity_retryable_status, antigravity_user_agent,
     catalog_is_stale, catalog_model_detail, client_metadata_header, is_retryable_empty_turn,
     merge_antigravity_model_ids, remap_unsupported_model,
@@ -814,10 +814,18 @@ impl Provider for AntigravityProvider {
 
     fn available_models_display(&self) -> Vec<String> {
         let catalog = self.fetched_catalog();
+        let catalog_ids: std::collections::HashSet<String> =
+            catalog.iter().map(|model| model.id.clone()).collect();
         merge_antigravity_model_ids(
             catalog
                 .into_iter()
                 .map(|model| model.id)
+                .chain(
+                    MODEL_ALIASES
+                        .iter()
+                        .filter(|(_, target)| catalog_ids.contains(*target))
+                        .map(|(alias, _)| alias.to_string()),
+                )
                 .chain(std::iter::once(self.model())),
         )
     }
@@ -829,17 +837,45 @@ impl Provider for AntigravityProvider {
     fn model_routes(&self) -> Vec<jcode_provider_core::ModelRoute> {
         let catalog = self.fetched_catalog();
         if !catalog.is_empty() {
-            return catalog
-                .into_iter()
+            let catalog_ids: std::collections::HashSet<String> =
+                catalog.iter().map(|model| model.id.clone()).collect();
+            let mut routes: Vec<jcode_provider_core::ModelRoute> = catalog
+                .iter()
                 .map(|model| jcode_provider_core::ModelRoute {
                     model: model.id.clone(),
                     provider: "Antigravity".to_string(),
                     api_method: "https".to_string(),
                     available: model.available,
-                    detail: catalog_model_detail(&model),
+                    detail: catalog_model_detail(model),
                     cheapness: None,
                 })
                 .collect();
+            for (alias, target) in MODEL_ALIASES {
+                if let Some(target_route) = catalog
+                    .iter()
+                    .find(|model| model.id == *target && model.available)
+                    .map(|model| jcode_provider_core::ModelRoute {
+                        model: model.id.clone(),
+                        provider: "Antigravity".to_string(),
+                        api_method: "https".to_string(),
+                        available: model.available,
+                        detail: format!(
+                            "alias of `{target}` (live-catalog, {})",
+                            catalog_model_detail(model)
+                        ),
+                        cheapness: None,
+                    })
+                {
+                    if catalog_ids.contains(*alias) {
+                        continue;
+                    }
+                    routes.push(jcode_provider_core::ModelRoute {
+                        model: alias.to_string(),
+                        ..target_route
+                    });
+                }
+            }
+            return routes;
         }
 
         self.available_models_display()
