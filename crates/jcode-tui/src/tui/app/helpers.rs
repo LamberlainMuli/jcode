@@ -2,6 +2,8 @@
 
 mod clipboard_helper;
 pub(crate) mod model_names;
+#[cfg(target_os = "linux")]
+mod wsl_clipboard;
 
 use crate::todo::TodoItem;
 use crate::tui::info_widget::{AmbientWidgetData, GitInfo};
@@ -929,6 +931,17 @@ pub(super) fn clipboard_image() -> Option<(String, String)> {
     {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
         return Some(("image/png".to_string(), b64));
+    }
+
+    // WSL: WSLg syncs clipboard *text* into the Wayland/X11 clipboards but not
+    // images, so after a Windows screenshot every backend above comes up empty.
+    // Ask the Windows clipboard directly through PowerShell as a last resort.
+    // Compiled out everywhere except Linux, gated on WSL detection at runtime,
+    // and reached only when the Linux backends found no image.
+    #[cfg(target_os = "linux")]
+    if let Some(result) = wsl_clipboard::windows_clipboard_image() {
+        crate::logging::info("clipboard_image: image read from Windows clipboard via WSL fallback");
+        return Some(result);
     }
 
     None
