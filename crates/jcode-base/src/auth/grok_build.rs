@@ -70,6 +70,23 @@ fn default_poll_interval() -> u64 {
     5
 }
 
+/// Resolve the directory holding `auth.json` for Grok Build credentials.
+///
+/// Mirrors the lookup order used by the Grok CLI itself: `GROK_HOME` points at
+/// the credential directory directly, otherwise the `.grok` directory inside
+/// the user home is used. Windows processes frequently have `USERPROFILE` set
+/// without `HOME`, so both are accepted as the user home.
+fn credential_home() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("GROK_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(home));
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".grok"))
+        .context("No home directory available for Grok Build credentials")
+}
+
 fn oauth_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     request
         .header("x-grok-client-version", "1.0.3")
@@ -166,10 +183,7 @@ fn save_tokens(tokens: TokenResponse) -> Result<()> {
         oidc_issuer: OAUTH_ISSUER,
         oidc_client_id: OAUTH_CLIENT_ID,
     };
-    let home = std::env::var_os("GROK_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".grok")))
-        .context("No home directory available for Grok Build credentials")?;
+    let home = credential_home()?;
     std::fs::create_dir_all(&home)?;
     let path = home.join("auth.json");
     let mut credentials = std::fs::read(&path)
@@ -226,10 +240,10 @@ pub fn has_cached_login() -> bool {
     {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+    let Ok(home) = credential_home() else {
         return false;
     };
-    let Ok(bytes) = std::fs::read(PathBuf::from(home).join(".grok").join("auth.json")) else {
+    let Ok(bytes) = std::fs::read(home.join("auth.json")) else {
         return false;
     };
     credentials_json_has_login(&bytes)
@@ -342,7 +356,64 @@ pub async fn ensure_cli() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{credentials_json_has_login, ensure_cli, valid_version};
+    use super::{credential_home, credentials_json_has_login, ensure_cli, valid_version};
+
+    fn with_env_vars<const N: usize>(
+        vars: [(&str, Option<&str>); N],
+    ) -> Option<std::path::PathBuf> {
+        // Serialize env mutation with other env-dependent tests in this crate.
+        let _env_lock = crate::storage::lock_test_env();
+        let previous: Vec<(&str, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(*name)))
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(value) => crate::env::set_var(name, value),
+                None => crate::env::remove_var(name),
+            }
+        }
+        let result = credential_home().ok();
+        for (name, value) in previous {
+            match value {
+                Some(value) => crate::env::set_var(name, value),
+                None => crate::env::remove_var(name),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn grok_home_wins_over_home_and_userprofile() {
+        let path = with_env_vars([
+            ("GROK_HOME", Some("/tmp/custom-grok-home")),
+            ("HOME", Some("/tmp/ignored-home")),
+            ("USERPROFILE", Some("C:\\ignored-profile")),
+        ])
+        .expect("GROK_HOME should resolve");
+        assert_eq!(path, std::path::PathBuf::from("/tmp/custom-grok-home"));
+    }
+
+    #[test]
+    fn userprofile_fallback_works_without_home() {
+        let path = with_env_vars([
+            ("GROK_HOME", None),
+            ("HOME", None),
+            ("USERPROFILE", Some("C:\\Users\\Example")),
+        ])
+        .expect("USERPROFILE should resolve");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("C:\\Users\\Example").join(".grok")
+        );
+    }
+
+    #[test]
+    fn missing_home_and_userprofile_fails() {
+        assert!(
+            with_env_vars([("GROK_HOME", None), ("HOME", None), ("USERPROFILE", None),]).is_none()
+        );
+    }
 
     #[test]
     fn accepts_only_safe_release_versions() {
