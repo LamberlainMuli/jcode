@@ -8,16 +8,41 @@
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 
 export function runtimeDir(): string {
   const explicit = process.env.JCODE_RUNTIME_DIR;
-  if (explicit) return explicit;
+  if (explicit) {
+    if (isUsableRuntimeDir(explicit) || mkdirSync(explicit)) return explicit;
+  }
+  // Containers can inherit a set-but-missing XDG_RUNTIME_DIR (e.g.
+  // /run/user/<uid> not provisioned inside the container). Trusting it blindly
+  // resolves sockets into a directory nothing can bind or dial, so it is only
+  // used when it points at an existing directory. Mirrors the Rust side.
   const xdg = process.env.XDG_RUNTIME_DIR;
-  if (xdg) return xdg;
+  if (xdg && isUsableRuntimeDir(xdg)) return xdg;
   if (process.platform === "darwin" && process.env.TMPDIR) {
-    return process.env.TMPDIR;
+    if (isUsableRuntimeDir(process.env.TMPDIR)) return process.env.TMPDIR;
   }
   return path.join(os.tmpdir(), `jcode-${userDiscriminator()}`);
+}
+
+function isUsableRuntimeDir(dir: string): boolean {
+  if (dir === "") return false;
+  try {
+    return fs.statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function mkdirSync(dir: string): boolean {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function userDiscriminator(): string {
